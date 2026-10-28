@@ -1,0 +1,14 @@
+[
+  {
+    "title": "Example Climate Hackathon",
+    "source_url": "https://events.example.test/2027/climate?utm_source=fixture",
+    "publisher_name": "Example Events",
+    "source_kind": "aggregator"
+  },
+  {
+    "title": "Example Data Competition",
+    "source_url": "https://events.example.test/2027/data",
+    "publisher_name": "Example Events",
+    "source_kind": "aggregator"
+  }
+]
