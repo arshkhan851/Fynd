@@ -32,7 +32,9 @@ def test_repeat_source_urls_are_idempotent(db_session):
     summary = persist_candidates(
         db_session,
         [
-            DiscoveryCandidate("Event", f"{url}?utm_source=one", "Example Events"),
+            DiscoveryCandidate(
+                "Event", f"{url}?utm_source=one", "Example Events", external_id="kaggle-event-1"
+            ),
             DiscoveryCandidate("Event duplicate", url, "Example Events"),
         ],
         {"example.test"},
@@ -45,7 +47,10 @@ def test_repeat_source_urls_are_idempotent(db_session):
     assert db_session.scalar(select(func.count()).select_from(CompetitionSource)) == 1
     evidence = db_session.scalar(select(FieldEvidence))
     assert evidence is not None
-    assert evidence.observed_value == {"title": "Event"}
+    assert evidence.observed_value == {
+        "title": "Event",
+        "source_external_id": "kaggle-event-1",
+    }
     assert evidence.review_state == "candidate"
     source = db_session.scalar(select(CompetitionSource))
     assert source is not None

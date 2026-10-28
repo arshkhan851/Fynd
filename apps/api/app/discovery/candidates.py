@@ -9,6 +9,7 @@ class DiscoveryCandidate:
     source_url: str
     publisher_name: str
     source_kind: str = "aggregator"
+    external_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.title, str):
@@ -19,6 +20,8 @@ class DiscoveryCandidate:
             raise ValueError("publisher name must be a string")
         if not isinstance(self.source_kind, str):
             raise ValueError("source kind must be a string")
+        if self.external_id is not None and not isinstance(self.external_id, str):
+            raise ValueError("external ID must be a string")
         if not self.title.strip():
             raise ValueError("candidate title must not be empty")
         if not self.publisher_name.strip():

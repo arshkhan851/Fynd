@@ -67,12 +67,15 @@ def persist_candidates(
                     )
                     session.add(source)
                     session.flush()
+                    observed_value = {"title": candidate.title.strip()}
+                    if candidate.external_id:
+                        observed_value["source_external_id"] = candidate.external_id
                     session.add(
                         FieldEvidence(
                             competition_id=competition.id,
                             source_id=source.id,
                             field_name="title",
-                            observed_value={"title": candidate.title.strip()},
+                            observed_value=observed_value,
                             evidence_excerpt=candidate.title.strip(),
                             review_state="candidate",
                         )

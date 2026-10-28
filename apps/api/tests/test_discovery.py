@@ -1,12 +1,25 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
+import requests
+from kagglesdk.competitions.types.competition_api_service import (
+    ApiCompetition,
+    ApiListCompetitionsResponse,
+)
 
 from app.discovery import DiscoveryCandidate
 from app.discovery.cli import _load_candidates
 from app.discovery.http import BoundedHttpClient, FetchError
+from app.discovery.kaggle import (
+    KaggleAuthenticationError,
+    KaggleDiscoveryAdapter,
+    KaggleMalformedResponseError,
+    KaggleRateLimitError,
+    KaggleTimeoutError,
+)
 from app.discovery.urls import UnsafeSourceUrl, normalize_source_url, validate_source_url
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -208,3 +221,282 @@ def test_candidate_loader_counts_malformed_entries(tmp_path):
     candidates, skipped = _load_candidates(source)
     assert candidates == []
     assert skipped == 5
+
+
+def _kaggle_competition(title, url, ref):
+    competition = ApiCompetition()
+    competition.title = title
+    competition.url = url
+    competition.ref = ref
+    return competition
+
+
+def _kaggle_response(competitions, next_page_token=None):
+    response = ApiListCompetitionsResponse()
+    response.competitions = competitions
+    response.next_page_token = next_page_token
+    return response
+
+
+def test_kaggle_adapter_maps_documented_fields_and_paginates():
+    first = _kaggle_response(
+        [
+            _kaggle_competition(
+                "First Challenge", "https://www.kaggle.com/competitions/first", "first"
+            )
+        ],
+        "next-page-token",
+    )
+    second = _kaggle_response(
+        [
+            _kaggle_competition(
+                "Second Challenge", "https://www.kaggle.com/competitions/second", "second"
+            )
+        ]
+    )
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+    calls = []
+
+    def competitions_list(**kwargs):
+        calls.append(kwargs)
+        return [first, second][len(calls) - 1]
+
+    fake_api.competitions_list = competitions_list
+    batch = KaggleDiscoveryAdapter(
+        api=fake_api, page_size=1, max_pages=2, result_limit=2
+    ).discover()
+
+    assert [candidate.title for candidate in batch.candidates] == [
+        "First Challenge",
+        "Second Challenge",
+    ]
+    assert [candidate.external_id for candidate in batch.candidates] == ["first", "second"]
+    assert [candidate.publisher_name for candidate in batch.candidates] == ["Kaggle", "Kaggle"]
+    assert batch.pages_fetched == 2
+    assert batch.skipped == 0
+    assert calls[0]["page_token"] is None
+    assert calls[1]["page_token"] == "next-page-token"
+    assert all(call["group"] == "general" for call in calls)
+
+
+def test_kaggle_adapter_caps_overfull_page_at_result_limit():
+    response = _kaggle_response(
+        [
+            _kaggle_competition(
+                f"Challenge {n}",
+                f"https://www.kaggle.com/competitions/{n}",
+                str(n),
+            )
+            for n in range(3)
+        ],
+        "should-not-fetch",
+    )
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+    calls = []
+
+    def competitions_list(**kwargs):
+        calls.append(kwargs)
+        return response
+
+    fake_api.competitions_list = competitions_list
+    batch = KaggleDiscoveryAdapter(
+        api=fake_api, page_size=5, max_pages=3, result_limit=2
+    ).discover()
+
+    assert [candidate.title for candidate in batch.candidates] == ["Challenge 0", "Challenge 1"]
+    assert batch.pages_fetched == 1
+    assert len(calls) == 1
+    assert calls[0]["page_size"] == 2
+
+
+def test_kaggle_adapter_never_fetches_more_than_max_pages():
+    responses = [
+        _kaggle_response(
+            [
+                _kaggle_competition(
+                    f"Challenge {n}",
+                    f"https://www.kaggle.com/competitions/{n}",
+                    str(n),
+                )
+            ],
+            f"token-{n}" if n == 0 else "another-token",
+        )
+        for n in range(3)
+    ]
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+    calls = []
+
+    def competitions_list(**kwargs):
+        calls.append(kwargs)
+        return responses[len(calls) - 1]
+
+    fake_api.competitions_list = competitions_list
+    batch = KaggleDiscoveryAdapter(
+        api=fake_api, page_size=2, max_pages=2, result_limit=4
+    ).discover()
+
+    assert len(batch.candidates) == 2
+    assert batch.pages_fetched == len(calls) == 2
+    assert calls[0]["page_token"] is None
+    assert calls[1]["page_token"] == "token-0"
+
+
+def test_kaggle_adapter_skips_unconfirmed_or_untrusted_rows():
+    response = _kaggle_response(
+        [
+            _kaggle_competition("", "https://www.kaggle.com/competitions/no-title", "no-title"),
+            _kaggle_competition("Unsafe", "https://attacker.test/competition/unsafe", "unsafe"),
+            _kaggle_competition("Valid", "https://www.kaggle.com/competitions/valid", "valid"),
+        ]
+    )
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+    fake_api.competitions_list = lambda **kwargs: response
+
+    batch = KaggleDiscoveryAdapter(
+        api=fake_api, page_size=5, max_pages=1, result_limit=5
+    ).discover()
+
+    assert [candidate.title for candidate in batch.candidates] == ["Valid"]
+    assert batch.skipped == 2
+
+
+def test_kaggle_adapter_handles_empty_and_malformed_responses():
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+    fake_api.competitions_list = lambda **kwargs: _kaggle_response([])
+    batch = KaggleDiscoveryAdapter(
+        api=fake_api, page_size=2, max_pages=1, result_limit=2
+    ).discover()
+    assert batch.candidates == ()
+    assert batch.pages_fetched == 1
+
+    fake_api.competitions_list = lambda **kwargs: None
+    with pytest.raises(KaggleMalformedResponseError):
+        KaggleDiscoveryAdapter(
+            api=fake_api, page_size=2, max_pages=1, result_limit=2
+        ).discover()
+
+
+def test_kaggle_adapter_suppresses_client_output(capsys):
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+
+    def competitions_list(**kwargs):
+        print("KAGGLE_SECRET_MUST_NOT_PRINT")
+        return _kaggle_response([])
+
+    fake_api.competitions_list = competitions_list
+    KaggleDiscoveryAdapter(
+        api=fake_api, page_size=2, max_pages=1, result_limit=2
+    ).discover()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_kaggle_adapter_reports_missing_authentication_without_client_output(capsys):
+    fake_api = type("FakeKaggleApi", (), {})()
+
+    def unauthenticated():
+        raise SystemExit(1)
+
+    fake_api.authenticate = unauthenticated
+    with pytest.raises(KaggleAuthenticationError, match="credentials"):
+        KaggleDiscoveryAdapter(
+            api=fake_api, page_size=2, max_pages=1, result_limit=2
+        ).discover()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (requests.Timeout("timeout"), KaggleTimeoutError),
+        (requests.HTTPError("rate limited", response=requests.Response()), KaggleRateLimitError),
+    ],
+)
+def test_kaggle_adapter_maps_timeouts_and_rate_limits(error, expected):
+    if isinstance(error, requests.HTTPError):
+        error.response.status_code = 429
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+    fake_api.competitions_list = lambda **kwargs: (_ for _ in ()).throw(error)
+
+    with pytest.raises(expected):
+        KaggleDiscoveryAdapter(
+            api=fake_api, page_size=2, max_pages=1, result_limit=2
+        ).discover()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_kaggle_adapter_maps_authentication_statuses(status):
+    response = requests.Response()
+    response.status_code = status
+    error = requests.HTTPError("authentication rejected", response=response)
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+    fake_api.competitions_list = lambda **kwargs: (_ for _ in ()).throw(error)
+
+    with pytest.raises(KaggleAuthenticationError):
+        KaggleDiscoveryAdapter(
+            api=fake_api, page_size=2, max_pages=1, result_limit=2
+        ).discover()
+
+
+@pytest.mark.parametrize("token", [123, "   ", [], {}])
+def test_kaggle_adapter_rejects_malformed_pagination_tokens(token):
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+    fake_api.competitions_list = lambda **kwargs: SimpleNamespace(
+        competitions=[
+            _kaggle_competition(
+                "Challenge",
+                "https://www.kaggle.com/competitions/challenge",
+                "challenge",
+            )
+        ],
+        next_page_token=token,
+    )
+
+    with pytest.raises(KaggleMalformedResponseError, match="pagination token"):
+        KaggleDiscoveryAdapter(
+            api=fake_api, page_size=2, max_pages=2, result_limit=2
+        ).discover()
+
+
+def test_kaggle_adapter_rejects_repeated_pagination_token():
+    responses = [
+        _kaggle_response(
+            [_kaggle_competition("A", "https://www.kaggle.com/competitions/a", "a")],
+            "token-a",
+        ),
+        _kaggle_response(
+            [_kaggle_competition("B", "https://www.kaggle.com/competitions/b", "b")],
+            "token-b",
+        ),
+        _kaggle_response(
+            [_kaggle_competition("C", "https://www.kaggle.com/competitions/c", "c")],
+            "token-a",
+        ),
+    ]
+    calls = []
+    fake_api = type("FakeKaggleApi", (), {})()
+    fake_api.authenticate = lambda: None
+
+    def competitions_list(**kwargs):
+        calls.append(kwargs)
+        return responses[len(calls) - 1]
+
+    fake_api.competitions_list = competitions_list
+    with pytest.raises(KaggleMalformedResponseError, match="pagination token"):
+        KaggleDiscoveryAdapter(
+            api=fake_api, page_size=1, max_pages=4, result_limit=4
+        ).discover()
+
+    assert [call["page_token"] for call in calls] == [None, "token-a", "token-b"]

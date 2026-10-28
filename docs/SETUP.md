@@ -50,6 +50,16 @@ The database port is available only on `127.0.0.1:5432`; data persists in the na
 6. Open http://127.0.0.1:8000/health or http://127.0.0.1:8000/health/db
 7. Test: .\.venv\Scripts\python -m pytest
 
+### Kaggle discovery
+Install the API requirements to add the official Kaggle client, then configure Kaggle authentication with `apps\api\.venv\Scripts\kaggle.exe auth login` from the repository root or `.\.venv\Scripts\kaggle.exe auth login` from `apps\api`; alternatively configure `KAGGLE_API_TOKEN` (never commit credentials). To manually run the bounded Kaggle listing adapter and persist up to 50 candidates:
+
+```powershell
+cd apps\api
+.\.venv\Scripts\python -m app.discovery.cli --kaggle --limit 50
+```
+
+Use `--limit` and `--page-size` to tune the bounded listing request. The command requires working Kaggle credentials and database connectivity; tests do not contact Kaggle.
+
 The API loads the root `.env` file without overriding environment variables already set by the process. `DATABASE_URL` is the preferred connection setting; leave it blank to have the API safely build a PostgreSQL URL from `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`, and `POSTGRES_DB`. A direct URL override must use URL-encoded credentials if they contain reserved characters.
 
 ## Known issues
