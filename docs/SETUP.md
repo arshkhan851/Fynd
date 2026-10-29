@@ -50,6 +50,15 @@ The database port is available only on `127.0.0.1:5432`; data persists in the na
 6. Open http://127.0.0.1:8000/health or http://127.0.0.1:8000/health/db
 7. Test: .\.venv\Scripts\python -m pytest
 
+### Competition listing API
+`GET /competitions` returns competitions with a non-null canonical title, ordered by ID ascending. It does not substitute pending evidence titles. Pagination uses `limit` (default `20`, minimum `1`, maximum `100`) and `offset` (default `0`, minimum `0`). The response contains `items`, `total`, `limit`, and `offset`; each item contains `id`, `title`, `format`, `official_url`, `event_starts_on`, `event_starts_at`, `registration_deadline_on`, and `registration_deadline_at`.
+
+The web app requests the first page with `limit=20` from `API_BASE_URL`. Set `API_BASE_URL` in `apps\web\.env.local` to the API base URL; the local development value is:
+
+```dotenv
+API_BASE_URL=http://127.0.0.1:8000
+```
+
 ### Kaggle discovery
 Install the API requirements to add the official Kaggle client, then configure Kaggle authentication with `apps\api\.venv\Scripts\kaggle.exe auth login` from the repository root or `.\.venv\Scripts\kaggle.exe auth login` from `apps\api`; alternatively configure `KAGGLE_API_TOKEN` (never commit credentials). To manually run the bounded Kaggle listing adapter and persist up to 50 candidates:
 
