@@ -83,7 +83,9 @@ def persist_candidates(
                         session.add(publisher)
                         session.flush()
 
-                    competition = Competition(title=candidate.title.strip())
+                    # A discovered title is only a candidate until an operator
+                    # explicitly accepts its field evidence.
+                    competition = Competition()
                     session.add(competition)
                     session.flush()
                     source = CompetitionSource(

@@ -60,6 +60,18 @@ cd apps\api
 
 Use `--limit` and `--page-size` to tune the bounded listing request. The command requires working Kaggle credentials and database connectivity; tests do not contact Kaggle.
 
+### Manual evidence review
+Discovery stores extracted values as candidate evidence; canonical competition fields are changed only when the evidence is accepted. From `apps\api`, list pending evidence, inspect one competition (including its source URLs and field evidence), or decide on an evidence record by ID:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.review.cli list --limit 100
+.\.venv\Scripts\python.exe -m app.review.cli show 123
+.\.venv\Scripts\python.exe -m app.review.cli accept 456
+.\.venv\Scripts\python.exe -m app.review.cli reject 789
+```
+
+Acceptance is supported for `title`, `description`, `eligibility_summary`, `format`, `event_timezone`, `official_url`, `registration_url`, `registration_opens`, `registration_deadline`, `event_starts`, and `event_ends`. Date evidence must provide either an ISO date in an `on` value or an offset-aware ISO datetime in an `at` value. Format, timezone, and URL evidence is validated before applying it. Organizer, category, topic, prize, and registration-status evidence can be inspected or rejected, but cannot be accepted until their canonical mapping is implemented. The CLI does not merge competitions.
+
 The API loads the root `.env` file without overriding environment variables already set by the process. `DATABASE_URL` is the preferred connection setting; leave it blank to have the API safely build a PostgreSQL URL from `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`, and `POSTGRES_DB`. A direct URL override must use URL-encoded credentials if they contain reserved characters.
 
 ## Known issues

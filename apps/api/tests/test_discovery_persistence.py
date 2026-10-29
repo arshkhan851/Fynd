@@ -49,6 +49,12 @@ def test_repeat_source_urls_are_idempotent(db_session):
     assert summary.discovered == 1
     assert summary.existing == 1
     assert summary.failed == 0
+    competition_id = db_session.scalar(
+        select(CompetitionSource.competition_id).where(
+            CompetitionSource.normalized_url == url
+        )
+    )
+    assert db_session.get(Competition, competition_id).title is None
     matching_sources = select(CompetitionSource.id).where(
         CompetitionSource.normalized_url == url
     )
@@ -384,14 +390,19 @@ def test_caller_rollback_removes_persisted_discovery(db_session):
 
 
 def test_failed_candidate_rolls_back_its_rows_and_continues(db_session, monkeypatch, caplog):
+    failure_url = "https://events.example.test/2027/failure"
     success_url = "https://events.example.test/2027/success"
     original_flush = db_session.flush
-    flush_count = 0
+    failed_competition_ids = []
 
     def fail_on_first_source_flush(objects=None):
-        nonlocal flush_count
-        flush_count += 1
-        if flush_count == 4:
+        pending_sources = [
+            row
+            for row in db_session.new
+            if isinstance(row, CompetitionSource) and row.normalized_url == failure_url
+        ]
+        if pending_sources:
+            failed_competition_ids.extend(row.competition_id for row in pending_sources)
             raise RuntimeError("simulated source insert failure")
         return original_flush(objects=objects)
 
@@ -401,7 +412,7 @@ def test_failed_candidate_rolls_back_its_rows_and_continues(db_session, monkeypa
         [
             DiscoveryCandidate(
                 "Will roll back",
-                "https://events.example.test/2027/failure",
+                failure_url,
                 "Example Events",
             ),
             DiscoveryCandidate(
@@ -417,9 +428,30 @@ def test_failed_candidate_rolls_back_its_rows_and_continues(db_session, monkeypa
     assert "Discovery candidate 1 failed persistence (RuntimeError)" in caplog.text
     assert summary.discovered == 1
     assert summary.existing == 0
+    assert len(failed_competition_ids) == 1
+    assert db_session.get(Competition, failed_competition_ids[0]) is None
     assert db_session.scalar(
-        select(Competition.title).where(Competition.title == "Will persist")
-    ) == "Will persist"
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == failure_url)
+    ) == 0
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(FieldEvidence)
+        .where(
+            FieldEvidence.source_id.in_(
+                select(CompetitionSource.id).where(
+                    CompetitionSource.normalized_url == failure_url
+                )
+            )
+        )
+    ) == 0
+    success_competition_id = db_session.scalar(
+        select(CompetitionSource.competition_id).where(
+            CompetitionSource.normalized_url == success_url
+        )
+    )
+    assert db_session.get(Competition, success_competition_id).title is None
     assert (
         db_session.scalar(
             select(func.count())
@@ -428,6 +460,19 @@ def test_failed_candidate_rolls_back_its_rows_and_continues(db_session, monkeypa
         )
         == 1
     )
+    success_evidence = db_session.scalar(
+        select(FieldEvidence).where(
+            FieldEvidence.source_id.in_(
+                select(CompetitionSource.id).where(
+                    CompetitionSource.normalized_url == success_url
+                )
+            )
+        )
+    )
+    assert success_evidence is not None
+    assert success_evidence.field_name == "title"
+    assert success_evidence.observed_value["title"] == "Will persist"
+    assert success_evidence.review_state == "candidate"
     assert (
         db_session.scalar(
             select(func.count())
