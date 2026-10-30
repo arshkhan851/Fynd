@@ -51,7 +51,9 @@ The database port is available only on `127.0.0.1:5432`; data persists in the na
 7. Test: .\.venv\Scripts\python -m pytest
 
 ### Competition listing API
-`GET /competitions` returns competitions with a non-null canonical title, ordered by ID ascending. It does not substitute pending evidence titles. Pagination uses `limit` (default `20`, minimum `1`, maximum `100`) and `offset` (default `0`, minimum `0`). The response contains `items`, `total`, `limit`, and `offset`; each item contains `id`, `title`, `format`, `official_url`, `event_starts_on`, `event_starts_at`, `registration_deadline_on`, and `registration_deadline_at`.
+`GET /competitions` returns competitions with a non-null canonical title, ordered by discovery time newest first and ID descending as a tie-breaker. It does not substitute pending evidence titles. Pagination uses `limit` (default `20`, minimum `1`, maximum `100`) and `offset` (default `0`, minimum `0`). The response contains `items`, `total`, `limit`, and `offset`; each item contains `id`, `title`, `format`, `official_url`, `event_starts_on`, `event_starts_at`, `registration_deadline_on`, and `registration_deadline_at`.
+
+`GET /competitions/{id}` returns `id`, `title`, `description`, `eligibility_summary`, `format`, official and registration URLs, registration/event dates, and `event_timezone`. Its public relationships are `categories` (`name`, `slug`, `is_primary`), `organizers` (`name`, `role`, `website_url`), `prizes` (`award_name`, `place`, decimal `amount` as a string, `currency`, `details`), and `sources` (`source_kind`, `source_url`, `publisher_name`, `publisher_homepage_url`). It returns `404` for missing competitions or records without a canonical title. Candidate, rejected, and superseded evidence is never returned or used as a fallback. External URLs are limited to credential-free HTTP(S) links. Source check status and verification timestamps are not exposed.
 
 The web app requests the first page with `limit=20` from `API_BASE_URL`. Set `API_BASE_URL` in `apps\web\.env.local` to the API base URL; the local development value is:
 

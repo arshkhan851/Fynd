@@ -1,13 +1,26 @@
 from collections.abc import Generator
+from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import engine, get_db
 from app.main import app
-from app.models import Competition, CompetitionSource, FieldEvidence
+from app.models import (
+    Category,
+    Competition,
+    CompetitionCategory,
+    CompetitionOrganizer,
+    CompetitionPrize,
+    CompetitionSource,
+    FieldEvidence,
+    Organizer,
+    SourcePublisher,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -77,11 +90,17 @@ def test_competitions_only_returns_canonical_titles_and_is_ordered(db_session, c
     assert response.status_code == 200
     payload = response.json()
     ids = [item["id"] for item in payload["items"]]
+    expected_ids = db_session.scalars(
+        select(Competition.id)
+        .where(Competition.title.is_not(None))
+        .order_by(Competition.discovered_at.desc(), Competition.id.desc())
+        .limit(100)
+    ).all()
     assert candidate_id not in ids
     assert first_id in ids
     assert second_id in ids
     assert all(item["title"] is not None for item in payload["items"])
-    assert ids == sorted(ids)
+    assert ids == expected_ids
     assert payload["total"] >= len(ids)
     assert set(payload["items"][ids.index(first_id)]) == {
         "id",
@@ -137,6 +156,164 @@ def test_competitions_hides_database_errors(client):
     app.dependency_overrides[get_db] = lambda: BrokenSession()
     try:
         response = client.get("/competitions")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"status": "unavailable"}}
+    assert "password" not in response.text
+
+
+def test_competition_detail_returns_canonical_fields_and_public_relationships(
+    db_session, client
+):
+    slug = f"test-category-{uuid4().hex}"
+    competition = Competition(
+        title="Reviewed competition",
+        description="Canonical overview.",
+        eligibility_summary="Open to students.",
+        format="online",
+        official_url="https://official.example.test/event",
+        registration_url="https://register.example.test/event",
+    )
+    category = Category(name="Artificial Intelligence", slug=slug)
+    organizer = Organizer(
+        name="Test Organizer", website_url="https://organizer.example.test"
+    )
+    publisher = SourcePublisher(
+        name="Test Publisher", homepage_url="https://publisher.example.test"
+    )
+    db_session.add_all([competition, category, organizer, publisher])
+    db_session.flush()
+    db_session.add_all(
+        [
+            CompetitionCategory(
+                competition_id=competition.id,
+                category_id=category.id,
+                is_primary=True,
+            ),
+            CompetitionOrganizer(
+                competition_id=competition.id,
+                organizer_id=organizer.id,
+                role="Host",
+            ),
+            CompetitionPrize(
+                competition_id=competition.id,
+                award_name="Grand prize",
+                place="1st",
+                amount=Decimal("250.00"),
+                currency="USD",
+            ),
+        ]
+    )
+    source = CompetitionSource(
+        competition_id=competition.id,
+        publisher_id=publisher.id,
+        source_kind="official",
+        source_url="https://source.example.test/event",
+        normalized_url="https://source.example.test/event",
+    )
+    db_session.add(source)
+    db_session.flush()
+    db_session.add(
+        FieldEvidence(
+            competition_id=competition.id,
+            source_id=source.id,
+            field_name="title",
+            observed_value={"title": "Unreviewed candidate title"},
+            review_state="candidate",
+        )
+    )
+    db_session.flush()
+
+    response = client.get(f"/competitions/{competition.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["title"] == "Reviewed competition"
+    assert payload["description"] == "Canonical overview."
+    assert payload["categories"] == [
+        {"name": "Artificial Intelligence", "slug": slug, "is_primary": True}
+    ]
+    assert payload["organizers"] == [
+        {
+            "name": "Test Organizer",
+            "role": "Host",
+            "website_url": "https://organizer.example.test",
+        }
+    ]
+    assert payload["prizes"] == [
+        {
+            "award_name": "Grand prize",
+            "place": "1st",
+            "amount": "250.00",
+            "currency": "USD",
+            "details": None,
+        }
+    ]
+    assert payload["sources"] == [
+        {
+            "source_kind": "official",
+            "source_url": "https://source.example.test/event",
+            "publisher_name": "Test Publisher",
+            "publisher_homepage_url": "https://publisher.example.test",
+        }
+    ]
+    assert "evidence" not in payload
+    assert "Unreviewed candidate title" not in response.text
+    assert "check_status" not in payload["sources"][0]
+    assert "last_verified_at" not in payload["sources"][0]
+
+
+def test_competition_detail_returns_not_found_for_missing_or_untitled_rows(
+    db_session, client
+):
+    untitled = Competition(title=None)
+    db_session.add(untitled)
+    db_session.flush()
+
+    missing_response = client.get("/competitions/999999999")
+    untitled_response = client.get(f"/competitions/{untitled.id}")
+
+    assert missing_response.status_code == 404
+    assert untitled_response.status_code == 404
+
+
+def test_competition_detail_omits_invalid_external_urls(db_session, client):
+    competition = Competition(
+        title="Canonical title",
+        official_url="javascript:alert(1)",
+    )
+    publisher = SourcePublisher(
+        name="Unsafe publisher", homepage_url="file:///etc/passwd"
+    )
+    db_session.add_all([competition, publisher])
+    db_session.flush()
+    source = CompetitionSource(
+        competition_id=competition.id,
+        publisher_id=publisher.id,
+        source_kind="aggregator",
+        source_url="javascript:alert(2)",
+    )
+    db_session.add(source)
+    db_session.flush()
+
+    response = client.get(f"/competitions/{competition.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["official_url"] is None
+    assert payload["sources"] == []
+
+
+def test_competition_detail_hides_database_errors(client):
+    class BrokenSession:
+        def scalars(self, statement):
+            raise RuntimeError("database password must not leak")
+
+    app.dependency_overrides[get_db] = lambda: BrokenSession()
+    try:
+        response = client.get("/competitions/1")
     finally:
         app.dependency_overrides.pop(get_db, None)
 
