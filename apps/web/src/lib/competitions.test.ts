@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getCompetition, getCompetitions } from "./competitions";
+import {
+  getCompetition,
+  getCompetitionCategories,
+  getCompetitions,
+} from "./competitions";
 
 const competition = {
   id: 12,
@@ -62,6 +66,23 @@ describe("getCompetitions", () => {
     });
   });
 
+  it("sends trimmed search, category, and pagination filters to the API", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      Response.json({ items: [competition], total: 21, limit: 20, offset: 20 }),
+    );
+
+    await getCompetitions("http://api.test", undefined, {
+      q: "  climate  ",
+      category: "climate-tech",
+      offset: 20,
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      new URL("http://api.test/competitions?limit=20&offset=20&q=climate&category=climate-tech"),
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
   it("returns API and network errors", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("unavailable", { status: 503 }),
@@ -94,6 +115,40 @@ describe("getCompetitions", () => {
     expect(await getCompetitions("")).toEqual({
       status: "error",
       message: "API_BASE_URL is not set",
+    });
+  });
+});
+
+describe("getCompetitionCategories", () => {
+  it("loads category names, slugs, and competition counts", async () => {
+    const categories = [
+      { name: "Climate", slug: "climate", competition_count: 4 },
+      { name: "Empty", slug: "empty", competition_count: 0 },
+    ];
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(categories));
+
+    expect(await getCompetitionCategories("http://api.test")).toEqual({
+      status: "ok",
+      data: categories,
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      new URL("http://api.test/categories"),
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
+  it("rejects an unexpected response shape and reports API errors", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json([{ name: "Climate" }]));
+    expect(await getCompetitionCategories("http://api.test")).toEqual({
+      status: "error",
+      message: "Unexpected response from API",
+    });
+
+    vi.restoreAllMocks();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("unavailable", { status: 503 }));
+    expect(await getCompetitionCategories("http://api.test")).toEqual({
+      status: "error",
+      message: "API returned HTTP 503",
     });
   });
 });

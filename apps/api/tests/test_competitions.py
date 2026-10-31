@@ -132,6 +132,161 @@ def test_competitions_pagination_defaults_and_limits(db_session, client):
     assert first_page.json()["total"] == full_page.json()["total"]
 
 
+def test_competitions_search_matches_title_and_description_case_insensitively(db_session, client):
+    title_match = Competition(title="Quantum Sprint Challenge")
+    description_match = Competition(
+        title="Other challenge", description="Build tools for renewable energy"
+    )
+    db_session.add_all([title_match, description_match])
+    db_session.flush()
+
+    title_response = client.get("/competitions", params={"q": "sPrInT"})
+    description_response = client.get("/competitions", params={"q": "RENEWABLE"})
+
+    assert [item["id"] for item in title_response.json()["items"]] == [title_match.id]
+    assert [item["id"] for item in description_response.json()["items"]] == [description_match.id]
+
+
+def test_competitions_search_trims_whitespace_and_empty_query_is_unfiltered(db_session, client):
+    match = Competition(title="Whitespace Search Match")
+    db_session.add(match)
+    db_session.flush()
+
+    trimmed = client.get("/competitions", params={"q": "  Search Match  "})
+    empty = client.get("/competitions", params={"q": ""})
+    whitespace = client.get("/competitions", params={"q": "   "})
+    unfiltered = client.get("/competitions")
+
+    assert [item["id"] for item in trimmed.json()["items"]] == [match.id]
+    assert empty.json() == unfiltered.json()
+    assert whitespace.json() == unfiltered.json()
+
+
+def test_competitions_search_no_match_and_excludes_candidate_evidence(db_session, client):
+    hidden = Competition(title=None)
+    db_session.add(hidden)
+    db_session.flush()
+    source = CompetitionSource(
+        competition_id=hidden.id,
+        source_kind="aggregator",
+        source_url="https://competition.test/evidence-search",
+        normalized_url="https://competition.test/evidence-search",
+    )
+    db_session.add(source)
+    db_session.flush()
+    db_session.add(
+        FieldEvidence(
+            competition_id=hidden.id,
+            source_id=source.id,
+            field_name="title",
+            observed_value={"title": "EvidenceOnlyNeedle"},
+            review_state="candidate",
+        )
+    )
+    db_session.flush()
+
+    evidence_response = client.get("/competitions", params={"q": "EvidenceOnlyNeedle"})
+    missing_response = client.get("/competitions", params={"q": "NoSuchCompetitionNeedle"})
+
+    assert evidence_response.json()["items"] == []
+    assert evidence_response.json()["total"] == 0
+    assert missing_response.json()["items"] == []
+    assert missing_response.json()["total"] == 0
+
+
+def test_competitions_search_total_is_before_pagination_and_preserves_order(db_session, client):
+    first = Competition(title="Searchable first")
+    second = Competition(title="Searchable second")
+    third = Competition(title="Searchable third")
+    Competition(title="Unrelated")
+    db_session.add_all([first, second, third])
+    db_session.flush()
+
+    all_matches = client.get("/competitions", params={"q": "Searchable", "limit": 100})
+    page = client.get("/competitions", params={"q": "Searchable", "limit": 1, "offset": 1})
+
+    assert all_matches.json()["total"] == 3
+    assert page.json()["total"] == 3
+    assert page.json()["limit"] == 1
+    assert page.json()["offset"] == 1
+    assert page.json()["items"] == all_matches.json()["items"][1:2]
+
+
+def test_competitions_filter_by_category_slug_and_unknown_category(db_session, client):
+    category = Category(name="AI Challenges", slug=f"ai-{uuid4().hex}")
+    match = Competition(title="AI competition")
+    unrelated = Competition(title="Other competition")
+    db_session.add_all([category, match, unrelated])
+    db_session.flush()
+    db_session.add(
+        CompetitionCategory(competition_id=match.id, category_id=category.id)
+    )
+    db_session.flush()
+
+    response = client.get("/competitions", params={"category": category.slug})
+    unknown = client.get("/competitions", params={"category": "missing-category"})
+
+    assert [item["id"] for item in response.json()["items"]] == [match.id]
+    assert response.json()["total"] == 1
+    assert unknown.status_code == 200
+    assert unknown.json()["items"] == []
+    assert unknown.json()["total"] == 0
+
+
+def test_competitions_category_combines_with_search_and_pagination(db_session, client):
+    category = Category(name="Climate", slug=f"climate-{uuid4().hex}")
+    matches = [Competition(title=f"Climate Spark {index}") for index in range(3)]
+    nonmatch = Competition(title="Climate unrelated")
+    db_session.add_all([category, *matches, nonmatch])
+    db_session.flush()
+    db_session.add_all(
+        CompetitionCategory(competition_id=item.id, category_id=category.id)
+        for item in matches
+    )
+    db_session.flush()
+
+    complete = client.get(
+        "/competitions", params={"category": category.slug, "q": "spark", "limit": 100}
+    )
+    page = client.get(
+        "/competitions",
+        params={"category": category.slug, "q": "spark", "limit": 1, "offset": 1},
+    )
+
+    assert complete.json()["total"] == 3
+    assert page.json()["total"] == 3
+    assert page.json()["items"] == complete.json()["items"][1:2]
+
+
+def test_category_counts_include_zero_and_exclude_untitled_competitions(db_session, client):
+    populated = Category(name="Counted category", slug=f"counted-{uuid4().hex}")
+    empty = Category(name="Empty category", slug=f"empty-{uuid4().hex}")
+    titled = Competition(title="Counted competition")
+    untitled = Competition(title=None)
+    db_session.add_all([populated, empty, titled, untitled])
+    db_session.flush()
+    db_session.add_all(
+        [
+            CompetitionCategory(competition_id=titled.id, category_id=populated.id),
+            CompetitionCategory(competition_id=untitled.id, category_id=populated.id),
+        ]
+    )
+    db_session.flush()
+
+    counts = client.get("/categories")
+    by_slug = {item["slug"]: item for item in counts.json()}
+    category_results = client.get("/competitions", params={"category": populated.slug})
+
+    assert by_slug[populated.slug] == {
+        "name": "Counted category",
+        "slug": populated.slug,
+        "competition_count": 1,
+    }
+    assert by_slug[empty.slug]["competition_count"] == 0
+    assert [item["id"] for item in category_results.json()["items"]] == [titled.id]
+    assert category_results.json()["total"] == 1
+
+
 @pytest.mark.parametrize(
     "params",
     [

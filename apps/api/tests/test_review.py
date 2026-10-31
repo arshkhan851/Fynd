@@ -4,18 +4,27 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import engine
-from app.models import Competition, CompetitionSource, FieldEvidence, SourcePublisher
+from app.models import (
+    Category,
+    Competition,
+    CompetitionCategory,
+    CompetitionSource,
+    FieldEvidence,
+    SourcePublisher,
+)
 from app.review import (
     ReviewError,
     UnsupportedEvidenceField,
     accept_evidence,
+    create_category_proposal,
     get_competition_detail,
     list_pending_evidence,
     reject_evidence,
+    unassign_category,
 )
 
 pytestmark = pytest.mark.integration
@@ -51,6 +60,7 @@ def _add_source_and_evidence(
     field_name="title",
     review_state="candidate",
     suffix="source",
+    field_key="",
 ):
     publisher = SourcePublisher(name=f"Review test publisher {suffix}")
     session.add(publisher)
@@ -68,6 +78,7 @@ def _add_source_and_evidence(
         competition_id=competition.id,
         source_id=source.id,
         field_name=field_name,
+        field_key=field_key,
         observed_value=value,
         evidence_excerpt=str(value),
         review_state=review_state,
@@ -332,4 +343,203 @@ def test_candidate_title_cleanup_migration_downgrade_fails_explicitly():
 
     with pytest.raises(RuntimeError, match="irreversible.*cannot be restored"):
         migration.downgrade()
+
+
+def _add_category_and_source(session, slug="review-category"):
+    competition = Competition(title="Category review competition")
+    category = Category(name="Review Category", slug=slug)
+    session.add_all([competition, category])
+    session.flush()
+    source, _ = _add_source_and_evidence(
+        session,
+        competition,
+        value={"title": "Category review competition"},
+        review_state="selected",
+        suffix=f"category-source-{slug}",
+    )
+    return competition, category, source
+
+
+def test_category_proposal_creation_uses_existing_slug_and_is_reviewable(db_session):
+    competition, category, source = _add_category_and_source(db_session)
+
+    proposal = create_category_proposal(
+        db_session, competition.id, category.slug, source.id
+    )
+    pending = list_pending_evidence(db_session, field_name="category")
+
+    assert proposal.field_name == "category"
+    assert proposal.field_key == category.slug
+    assert proposal.observed_value["slug"] == category.slug
+    listed = next(item for item in pending if item["evidence_id"] == proposal.id)
+    assert listed["category_name"] == category.name
+    assert listed["category_slug"] == category.slug
+
+
+def test_unknown_category_slug_cannot_be_proposed_or_accepted(db_session):
+    competition = Competition(title="No category competition")
+    db_session.add(competition)
+    db_session.flush()
+    source, _ = _add_source_and_evidence(
+        db_session, competition, value={"title": competition.title}, suffix="unknown-cat"
+    )
+
+    with pytest.raises(ReviewError, match="does not exist"):
+        create_category_proposal(db_session, competition.id, "unknown-slug", source.id)
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(FieldEvidence)
+        .where(
+            FieldEvidence.competition_id == competition.id,
+            FieldEvidence.field_name == "category",
+        )
+    ) == 0
+
+    proposal = FieldEvidence(
+        competition_id=competition.id,
+        source_id=source.id,
+        field_name="category",
+        field_key="unknown-slug",
+        observed_value={"slug": "unknown-slug"},
+    )
+    db_session.add(proposal)
+    db_session.flush()
+    with pytest.raises(ReviewError, match="does not exist"):
+        accept_evidence(db_session, proposal.id)
+    db_session.refresh(proposal)
+    assert proposal.review_state == "candidate"
+
+
+def test_accepting_category_proposal_assigns_and_selects_evidence(db_session):
+    competition, category, source = _add_category_and_source(db_session)
+    proposal = create_category_proposal(db_session, competition.id, category.slug, source.id)
+
+    accepted = accept_evidence(db_session, proposal.id)
+
+    link = db_session.get(CompetitionCategory, (competition.id, category.id))
+    assert accepted.review_state == "selected"
+    assert link is not None
+    assert link.is_primary is False
+
+
+def test_repeated_category_approval_supersedes_evidence_without_duplicate_link(db_session):
+    competition, category, source = _add_category_and_source(db_session)
+    first = create_category_proposal(db_session, competition.id, category.slug, source.id)
+    second = create_category_proposal(db_session, competition.id, category.slug, source.id)
+
+    accept_evidence(db_session, first.id)
+    with pytest.raises(ReviewError, match="already selected"):
+        accept_evidence(db_session, first.id)
+    accept_evidence(db_session, second.id)
+
+    db_session.refresh(first)
+    assert first.review_state == "superseded"
+    assert second.review_state == "selected"
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionCategory)
+        .where(
+            CompetitionCategory.competition_id == competition.id,
+            CompetitionCategory.category_id == category.id,
+        )
+    ) == 1
+
+
+def test_rejected_category_proposal_does_not_assign_category(db_session):
+    competition, category, source = _add_category_and_source(db_session)
+    proposal = create_category_proposal(db_session, competition.id, category.slug, source.id)
+
+    rejected = reject_evidence(db_session, proposal.id)
+
+    assert rejected.review_state == "rejected"
+    assert db_session.get(CompetitionCategory, (competition.id, category.id)) is None
+
+
+def test_failed_category_assignment_rolls_back_relationship_and_evidence(db_session, monkeypatch):
+    competition, category, source = _add_category_and_source(db_session)
+    proposal = create_category_proposal(db_session, competition.id, category.slug, source.id)
+    original_flush = db_session.flush
+    flush_count = 0
+
+    def fail_assignment_flush(objects=None):
+        nonlocal flush_count
+        flush_count += 1
+        if flush_count == 2:
+            raise RuntimeError("simulated assignment flush failure")
+        return original_flush(objects=objects)
+
+    monkeypatch.setattr(db_session, "flush", fail_assignment_flush)
+    with pytest.raises(RuntimeError, match="assignment flush"):
+        accept_evidence(db_session, proposal.id)
+    monkeypatch.setattr(db_session, "flush", original_flush)
+    db_session.expire_all()
+
+    assert db_session.get(CompetitionCategory, (competition.id, category.id)) is None
+    assert db_session.get(FieldEvidence, proposal.id).review_state == "candidate"
+
+
+def test_competition_can_have_multiple_category_proposals_and_assignments(db_session):
+    competition, first_category, source = _add_category_and_source(db_session, "first-category")
+    second_category = Category(name="Second Category", slug="second-category")
+    db_session.add(second_category)
+    db_session.flush()
+    first = create_category_proposal(
+        db_session, competition.id, first_category.slug, source.id
+    )
+    second = create_category_proposal(
+        db_session, competition.id, second_category.slug, source.id
+    )
+
+    accept_evidence(db_session, first.id)
+    accept_evidence(db_session, second.id)
+
+    links = db_session.scalars(
+        select(CompetitionCategory).where(CompetitionCategory.competition_id == competition.id)
+    ).all()
+    assert {link.category_id for link in links} == {first_category.id, second_category.id}
+    assert first.field_key != second.field_key
+
+
+def test_unassigning_category_removes_link_and_supersedes_approval(db_session):
+    competition, category, source = _add_category_and_source(db_session)
+    proposal = create_category_proposal(db_session, competition.id, category.slug, source.id)
+    accept_evidence(db_session, proposal.id)
+
+    unassign_category(db_session, competition.id, category.slug)
+
+    db_session.refresh(proposal)
+    assert db_session.get(CompetitionCategory, (competition.id, category.id)) is None
+    assert proposal.review_state == "superseded"
+
+
+def test_category_primary_uniqueness_is_respected(db_session):
+    competition, first_category, source = _add_category_and_source(db_session, "primary-one")
+    second_category = Category(name="Second Primary", slug="primary-two")
+    db_session.add(second_category)
+    db_session.flush()
+    first = create_category_proposal(
+        db_session, competition.id, first_category.slug, source.id, is_primary=True
+    )
+    second = create_category_proposal(
+        db_session, competition.id, second_category.slug, source.id, is_primary=True
+    )
+
+    accept_evidence(db_session, first.id)
+    with pytest.raises(ReviewError, match="already has a primary category"):
+        accept_evidence(db_session, second.id)
+
+    db_session.refresh(second)
+    assert second.review_state == "candidate"
+    assert db_session.get(CompetitionCategory, (competition.id, first_category.id)).is_primary
+    assert db_session.get(CompetitionCategory, (competition.id, second_category.id)) is None
+    with pytest.raises(IntegrityError):
+        with db_session.begin_nested():
+            db_session.add(
+                CompetitionCategory(
+                    competition_id=competition.id,
+                    category_id=second_category.id,
+                    is_primary=True,
+                )
+            )
+            db_session.flush()
 

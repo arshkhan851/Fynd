@@ -16,6 +16,23 @@ export type CompetitionPage = {
   offset: number;
 };
 
+export type CompetitionCategoryOption = {
+  name: string;
+  slug: string;
+  competition_count: number;
+};
+
+export type CompetitionCategoryResult =
+  | { status: "ok"; data: CompetitionCategoryOption[] }
+  | { status: "error"; message: string };
+
+export type CompetitionFilters = {
+  q?: string;
+  category?: string;
+  limit?: number;
+  offset?: number;
+};
+
 export type CompetitionCategory = {
   name: string;
   slug: string;
@@ -179,6 +196,7 @@ function isCompetitionPage(value: unknown): value is CompetitionPage {
 export async function getCompetitions(
   baseUrl: string | undefined = process.env.API_BASE_URL,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  filters: CompetitionFilters = {},
 ): Promise<CompetitionResult> {
   if (!baseUrl) {
     return { status: "error", message: "API_BASE_URL is not set" };
@@ -186,8 +204,10 @@ export async function getCompetitions(
 
   try {
     const url = new URL("/competitions", baseUrl);
-    url.searchParams.set("limit", String(DEFAULT_LIMIT));
-    url.searchParams.set("offset", "0");
+    url.searchParams.set("limit", String(filters.limit ?? DEFAULT_LIMIT));
+    url.searchParams.set("offset", String(filters.offset ?? 0));
+    if (filters.q?.trim()) url.searchParams.set("q", filters.q.trim());
+    if (filters.category) url.searchParams.set("category", filters.category);
     const response = await fetch(url, {
       cache: "no-store",
       signal: AbortSignal.timeout(timeoutMs),
@@ -204,6 +224,43 @@ export async function getCompetitions(
       return { status: "error", message: "Unexpected response from API" };
     }
     return { status: "ok", data };
+  } catch {
+    return { status: "error", message: "Could not reach the API" };
+  }
+}
+
+export async function getCompetitionCategories(
+  baseUrl: string | undefined = process.env.API_BASE_URL,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<CompetitionCategoryResult> {
+  if (!baseUrl) {
+    return { status: "error", message: "API_BASE_URL is not set" };
+  }
+
+  try {
+    const response = await fetch(new URL("/categories", baseUrl), {
+      cache: "no-store",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      return { status: "error", message: `API returned HTTP ${response.status}` };
+    }
+
+    const data: unknown = await response.json();
+    if (
+      !Array.isArray(data) ||
+      !data.every(
+        (entry) =>
+          typeof entry === "object" &&
+          entry !== null &&
+          typeof (entry as Record<string, unknown>).name === "string" &&
+          typeof (entry as Record<string, unknown>).slug === "string" &&
+          typeof (entry as Record<string, unknown>).competition_count === "number",
+      )
+    ) {
+      return { status: "error", message: "Unexpected response from API" };
+    }
+    return { status: "ok", data: data as CompetitionCategoryOption[] };
   } catch {
     return { status: "error", message: "Could not reach the API" };
   }

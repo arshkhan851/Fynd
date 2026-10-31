@@ -6,11 +6,12 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import check_database_connectivity, get_db
 from app.models import (
+    Category,
     Competition,
     CompetitionCategory,
     CompetitionOrganizer,
@@ -50,6 +51,12 @@ class CompetitionListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class CategoryCount(BaseModel):
+    name: str
+    slug: str
+    competition_count: int
 
 
 class PublicCategory(BaseModel):
@@ -139,15 +146,30 @@ def list_competitions(
     session: Annotated[Session, Depends(get_db)],
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
+    q: Annotated[str | None, Query()] = None,
+    category: Annotated[str | None, Query()] = None,
 ) -> CompetitionListResponse:
     visible_competitions = Competition.title.is_not(None)
+    search_term = q.strip() if q else ""
+    filters = [visible_competitions]
+    if search_term:
+        pattern = f"%{search_term}%"
+        filters.append(
+            or_(Competition.title.ilike(pattern), Competition.description.ilike(pattern))
+        )
+    if category:
+        filters.append(
+            Competition.category_links.any(
+                CompetitionCategory.category.has(Category.slug == category)
+            )
+        )
     try:
         total = session.scalar(
-            select(func.count()).select_from(Competition).where(visible_competitions)
+            select(func.count()).select_from(Competition).where(*filters)
         )
         competitions = session.scalars(
             select(Competition)
-            .where(visible_competitions)
+            .where(*filters)
             .order_by(Competition.discovered_at.desc(), Competition.id.desc())
             .limit(limit)
             .offset(offset)
@@ -175,6 +197,34 @@ def list_competitions(
         limit=limit,
         offset=offset,
     )
+
+
+@app.get("/categories", response_model=list[CategoryCount])
+def list_categories(session: Annotated[Session, Depends(get_db)]) -> list[CategoryCount]:
+    eligible_counts = (
+        select(
+            CompetitionCategory.category_id.label("category_id"),
+            func.count(CompetitionCategory.competition_id).label("competition_count"),
+        )
+        .join(Competition, Competition.id == CompetitionCategory.competition_id)
+        .where(Competition.title.is_not(None))
+        .group_by(CompetitionCategory.category_id)
+        .subquery()
+    )
+    statement = (
+        select(
+            Category.name,
+            Category.slug,
+            func.coalesce(eligible_counts.c.competition_count, 0).label("competition_count"),
+        )
+        .outerjoin(eligible_counts, eligible_counts.c.category_id == Category.id)
+        .order_by(func.lower(Category.name), Category.slug)
+    )
+    try:
+        rows = session.execute(statement).all()
+    except Exception:
+        raise HTTPException(status_code=503, detail={"status": "unavailable"}) from None
+    return [CategoryCount(**row._mapping) for row in rows]
 
 
 @app.get(
