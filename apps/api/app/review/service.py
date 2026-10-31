@@ -10,7 +10,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Competition, CompetitionSource, FieldEvidence, SourcePublisher
+from app.models import (
+    Category,
+    Competition,
+    CompetitionCategory,
+    CompetitionSource,
+    FieldEvidence,
+    SourcePublisher,
+)
 
 
 class ReviewError(ValueError):
@@ -130,19 +137,23 @@ def _transaction(session: Session):
     return nullcontext() if session.in_transaction() else session.begin()
 
 
-def list_pending_evidence(session: Session, limit: int = 100) -> list[dict[str, Any]]:
+def list_pending_evidence(
+    session: Session, limit: int = 100, field_name: str | None = None
+) -> list[dict[str, Any]]:
     if not 1 <= limit <= 1000:
         raise ValueError("limit must be between 1 and 1000")
-    rows = session.execute(
+    statement = (
         select(FieldEvidence, Competition.title, CompetitionSource.source_url,
                SourcePublisher.name)
         .join(Competition, Competition.id == FieldEvidence.competition_id)
         .join(CompetitionSource, CompetitionSource.id == FieldEvidence.source_id)
         .outerjoin(SourcePublisher, SourcePublisher.id == CompetitionSource.publisher_id)
         .where(FieldEvidence.review_state == "candidate")
-        .order_by(FieldEvidence.observed_at, FieldEvidence.id)
-        .limit(limit)
-    ).all()
+    )
+    if field_name is not None:
+        statement = statement.where(FieldEvidence.field_name == field_name)
+    statement = statement.order_by(FieldEvidence.observed_at, FieldEvidence.id).limit(limit)
+    rows = session.execute(statement).all()
     return [
         {
             "evidence_id": evidence.id,
@@ -150,6 +161,12 @@ def list_pending_evidence(session: Session, limit: int = 100) -> list[dict[str, 
             "canonical_title": canonical_title,
             "field_name": evidence.field_name,
             "field_key": evidence.field_key,
+            "category_name": (
+                evidence.observed_value.get("name")
+                if evidence.field_name == "category"
+                else None
+            ),
+            "category_slug": evidence.field_key if evidence.field_name == "category" else None,
             "observed_value": evidence.observed_value,
             "evidence_excerpt": evidence.evidence_excerpt,
             "observed_at": evidence.observed_at,
@@ -205,6 +222,14 @@ def get_competition_detail(session: Session, competition_id: int) -> dict[str, A
                         "id": evidence.id,
                         "field_name": evidence.field_name,
                         "field_key": evidence.field_key,
+                        "category_name": (
+                            evidence.observed_value.get("name")
+                            if evidence.field_name == "category"
+                            else None
+                        ),
+                        "category_slug": (
+                            evidence.field_key if evidence.field_name == "category" else None
+                        ),
                         "observed_value": evidence.observed_value,
                         "evidence_excerpt": evidence.evidence_excerpt,
                         "confidence": evidence.confidence,
@@ -239,8 +264,35 @@ def accept_evidence(session: Session, evidence_id: int) -> FieldEvidence:
         )
         if competition is None:
             raise ReviewError(f"competition {evidence.competition_id} was not found")
-        # Validate support and value before changing any review state.
-        _apply_canonical_value(competition, evidence)
+        category: Category | None = None
+        category_is_primary = False
+        category_link: CompetitionCategory | None = None
+        if evidence.field_name == "category":
+            category, category_is_primary = _resolve_category_evidence(session, evidence)
+            category_link = session.scalar(
+                select(CompetitionCategory)
+                .where(
+                    CompetitionCategory.competition_id == competition.id,
+                    CompetitionCategory.category_id == category.id,
+                )
+                .with_for_update()
+            )
+            if category_is_primary:
+                another_primary = session.scalar(
+                    select(CompetitionCategory.category_id).where(
+                        CompetitionCategory.competition_id == competition.id,
+                        CompetitionCategory.is_primary.is_(True),
+                        CompetitionCategory.category_id != category.id,
+                    )
+                )
+                if another_primary is not None:
+                    raise ReviewError(
+                        "competition already has a primary category; unassign it before "
+                        "assigning a new primary category"
+                    )
+        else:
+            # Keep scalar evidence behavior unchanged.
+            _apply_canonical_value(competition, evidence)
         previous = session.scalars(
             select(FieldEvidence)
             .where(
@@ -255,10 +307,130 @@ def accept_evidence(session: Session, evidence_id: int) -> FieldEvidence:
         now = datetime.now(UTC)
         for previous_evidence in previous:
             previous_evidence.review_state = "superseded"
+        if category is not None:
+            # Release the selected-evidence unique key before selecting its replacement.
+            session.flush()
+            if category_link is None:
+                session.add(
+                    CompetitionCategory(
+                        competition_id=competition.id,
+                        category_id=category.id,
+                        is_primary=category_is_primary,
+                    )
+                )
+            elif category_is_primary:
+                category_link.is_primary = True
         evidence.review_state = "selected"
         evidence.reviewed_at = now
         session.flush()
     return evidence
+
+
+def _resolve_category_evidence(
+    session: Session, evidence: FieldEvidence
+) -> tuple[Category, bool]:
+    slug = evidence.field_key
+    if not slug or len(slug) > 100 or slug.strip() != slug:
+        raise ReviewError("category evidence field_key must be a canonical category slug")
+    value = evidence.observed_value
+    if not isinstance(value, dict) or value.get("slug") != slug:
+        raise ReviewError("category evidence value slug must match its field_key")
+    is_primary = value.get("is_primary", False)
+    if not isinstance(is_primary, bool):
+        raise ReviewError("category evidence is_primary value must be a boolean")
+    category = session.scalar(select(Category).where(Category.slug == slug))
+    if category is None:
+        raise ReviewError(f"canonical category '{slug}' does not exist")
+    return category, is_primary
+
+
+def create_category_proposal(
+    session: Session,
+    competition_id: int,
+    category_slug: str,
+    source_id: int,
+    *,
+    is_primary: bool = False,
+) -> FieldEvidence:
+    with _transaction(session), session.begin_nested():
+        competition = session.scalar(
+            select(Competition)
+            .where(Competition.id == competition_id)
+            .with_for_update()
+        )
+        if competition is None:
+            raise ReviewError(f"competition {competition_id} was not found")
+        category = session.scalar(select(Category).where(Category.slug == category_slug))
+        if category is None:
+            raise ReviewError(f"canonical category '{category_slug}' does not exist")
+        source = session.scalar(
+            select(CompetitionSource).where(
+                CompetitionSource.id == source_id,
+                CompetitionSource.competition_id == competition_id,
+            )
+        )
+        if source is None:
+            raise ReviewError(
+                f"source {source_id} does not belong to competition {competition_id}"
+            )
+        proposal = FieldEvidence(
+            competition_id=competition_id,
+            source_id=source_id,
+            field_name="category",
+            field_key=category.slug,
+            observed_value={
+                "slug": category.slug,
+                "name": category.name,
+                "is_primary": is_primary,
+            },
+            evidence_excerpt=f"{category.name} ({category.slug})",
+            review_state="candidate",
+        )
+        session.add(proposal)
+        session.flush()
+    return proposal
+
+
+def unassign_category(session: Session, competition_id: int, category_slug: str) -> None:
+    with _transaction(session), session.begin_nested():
+        competition = session.scalar(
+            select(Competition)
+            .where(Competition.id == competition_id)
+            .with_for_update()
+        )
+        if competition is None:
+            raise ReviewError(f"competition {competition_id} was not found")
+        category = session.scalar(select(Category).where(Category.slug == category_slug))
+        if category is None:
+            raise ReviewError(f"canonical category '{category_slug}' does not exist")
+        link = session.scalar(
+            select(CompetitionCategory)
+            .where(
+                CompetitionCategory.competition_id == competition_id,
+                CompetitionCategory.category_id == category.id,
+            )
+            .with_for_update()
+        )
+        if link is None:
+            raise ReviewError(
+                f"category '{category_slug}' is not assigned to competition {competition_id}"
+            )
+        session.delete(link)
+        selected_evidence = session.scalars(
+            select(FieldEvidence)
+            .where(
+                FieldEvidence.competition_id == competition_id,
+                FieldEvidence.field_name == "category",
+                FieldEvidence.field_key == category.slug,
+                FieldEvidence.review_state == "selected",
+            )
+            .with_for_update()
+        ).all()
+        now = datetime.now(UTC)
+        for evidence in selected_evidence:
+            evidence.review_state = "superseded"
+            evidence.reviewed_at = now
+        session.flush()
 
 
 def reject_evidence(session: Session, evidence_id: int) -> FieldEvidence:
