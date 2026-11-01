@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS
 from app.models import (
     Category,
     Competition,
@@ -85,32 +86,39 @@ def _validate_date_evidence(value: Any, field_name: str) -> tuple[date | datetim
     raise ReviewError(f"{field_name} evidence must contain exactly one 'on' or 'at' value")
 
 
+_SCALAR_FIELD_MAPPINGS: dict[str, tuple[str, Callable[[Any], Any]]] = {
+    "title": ("title", lambda value: _validate_text(value, "title")),
+    "description": ("description", lambda value: _validate_text(value, "description")),
+    "eligibility_summary": (
+        "eligibility_summary",
+        lambda value: _validate_text(value, "eligibility_summary"),
+    ),
+    "format": ("format", _validate_format),
+    "event_timezone": ("event_timezone", _validate_timezone),
+    "official_url": ("official_url", lambda value: _validate_url(value, "official_url")),
+    "registration_url": (
+        "registration_url",
+        lambda value: _validate_url(value, "registration_url"),
+    ),
+}
+
+_DATE_FIELD_COLUMNS = {
+    "registration_opens": ("registration_opens_on", "registration_opens_at"),
+    "registration_deadline": ("registration_deadline_on", "registration_deadline_at"),
+    "event_starts": ("event_starts_on", "event_starts_at"),
+    "event_ends": ("event_ends_on", "event_ends_at"),
+}
+
+
 def _scalar_mapping(field_name: str) -> tuple[str, Callable[[Any], Any]]:
-    mappings: dict[str, tuple[str, Callable[[Any], Any]]] = {
-        "title": ("title", lambda value: _validate_text(value, "title")),
-        "description": ("description", lambda value: _validate_text(value, "description")),
-        "eligibility_summary": (
-            "eligibility_summary",
-            lambda value: _validate_text(value, "eligibility_summary"),
-        ),
-        "format": ("format", _validate_format),
-        "event_timezone": ("event_timezone", _validate_timezone),
-        "official_url": ("official_url", lambda value: _validate_url(value, "official_url")),
-        "registration_url": (
-            "registration_url",
-            lambda value: _validate_url(value, "registration_url"),
-        ),
-    }
-    mapping = mappings.get(field_name)
+    if field_name not in REVIEW_SUPPORTED_EVIDENCE_FIELDS or field_name == "category":
+        raise UnsupportedEvidenceField(
+            f"evidence field '{field_name}' is not supported for scalar acceptance"
+        )
+    mapping = _SCALAR_FIELD_MAPPINGS.get(field_name)
     if mapping is not None:
         return mapping
-    date_columns = {
-        "registration_opens": ("registration_opens_on", "registration_opens_at"),
-        "registration_deadline": ("registration_deadline_on", "registration_deadline_at"),
-        "event_starts": ("event_starts_on", "event_starts_at"),
-        "event_ends": ("event_ends_on", "event_ends_at"),
-    }
-    columns = date_columns.get(field_name)
+    columns = _DATE_FIELD_COLUMNS.get(field_name)
     if columns is not None:
         return "|".join(columns), lambda value: _validate_date_evidence(value, field_name)
     raise UnsupportedEvidenceField(f"evidence field '{field_name}' is not supported for acceptance")

@@ -1,11 +1,13 @@
 import io
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
 
 from app.discovery.candidates import DiscoveryCandidate
+from app.discovery.registry import RegistryError, authorize_source_execution
 from app.discovery.urls import UnsafeSourceUrl, validate_source_url
 
 KAGGLE_ALLOWED_HOSTS = {"kaggle.com"}
@@ -75,6 +77,7 @@ class KaggleDiscoveryAdapter:
         page_size: int = 20,
         max_pages: int = 3,
         result_limit: int = 50,
+        registry_path: str | Path | None = None,
     ) -> None:
         if not 1 <= page_size <= 200:
             raise ValueError("page_size must be between 1 and 200")
@@ -86,6 +89,7 @@ class KaggleDiscoveryAdapter:
         self.page_size = page_size
         self.max_pages = max_pages
         self.result_limit = result_limit
+        self.registry_path = registry_path
 
     @staticmethod
     def _default_api() -> Any:
@@ -126,6 +130,11 @@ class KaggleDiscoveryAdapter:
             raise _raise_api_error(exc) from exc
 
     def discover(self) -> KaggleDiscoveryBatch:
+        # The guard must run before client construction/authentication or any request.
+        try:
+            authorize_source_execution("kaggle", self.registry_path)
+        except RegistryError as exc:
+            raise KaggleDiscoveryError(str(exc)) from exc
         api = self.api if self.api is not None else self._default_api()
         self._authenticate(api)
 
