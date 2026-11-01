@@ -1,0 +1,68 @@
+[registry]
+version = 1
+contact_url = "https://fynd.example/contact"
+contact_url_checked_on = ""
+user_agent = "FyndDiscovery/0.1 (+https://fynd.example/contact)"
+
+[[source]]
+id = "kaggle"
+name = "Kaggle Competitions"
+publisher_name = "Kaggle"
+homepage_url = "https://www.kaggle.com"
+source_kind = "aggregator"
+status = "auditing"
+status_reason = ""
+adapter = "app.discovery.kaggle"
+
+[source.access]
+method = "official_client"
+allowed_hosts = ["kaggle.com"]
+auth_env_var = "KAGGLE_API_TOKEN"
+auth_failure_403_markers = []
+
+[source.use]
+fields = ["title"]
+triggers = ["manual"]
+frequency = "monthly"
+
+[source.permission]
+robots_checked_on = ""
+robots_result = "unknown"
+terms_url = ""
+terms_reviewed_on = ""
+terms_decision = "unknown"
+terms_notes = ""
+previous_terms_decision = ""
+terms_change_reference = ""
+
+[source.permission.grant]
+status = "none"
+requested_on = ""
+granted_on = ""
+expires_on = ""
+granted_by_role = ""
+scope = []
+conditions = ""
+reference = ""
+evidence_stored_offrepo = false
+
+[source.limits]
+min_request_interval_s = 1.0
+max_items_per_run = 50
+max_response_bytes = 1000000
+max_retries = 2
+max_retry_after_s = 30
+rate_limit_statuses = [429]
+
+[source.attribution]
+display_name = "Kaggle"
+link_required = true
+required_text = ""
+
+[source.audit]
+last_audit_on = ""
+next_audit_due = ""
+auditor = ""
+latest_note = ""
+approved_on = ""
+approved_by = ""

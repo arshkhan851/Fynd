@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import engine
+from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS
 from app.models import (
     Category,
     Competition,
@@ -26,8 +27,18 @@ from app.review import (
     reject_evidence,
     unassign_category,
 )
+from app.review import service as review_service
 
 pytestmark = pytest.mark.integration
+
+
+def test_review_acceptance_paths_match_shared_evidence_vocabulary():
+    scalar_fields = set(review_service._SCALAR_FIELD_MAPPINGS) | set(
+        review_service._DATE_FIELD_COLUMNS
+    )
+    acceptance_fields = scalar_fields | {"category"}
+
+    assert acceptance_fields == REVIEW_SUPPORTED_EVIDENCE_FIELDS
 
 
 @pytest.fixture(scope="module")

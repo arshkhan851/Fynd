@@ -25,6 +25,15 @@ from app.discovery.urls import UnsafeSourceUrl, normalize_source_url, validate_s
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _allow_offline_adapter_unit_tests(monkeypatch):
+    """These tests exercise parsing with fake clients; execution-guard tests use real paths."""
+    monkeypatch.setattr(
+        "app.discovery.kaggle.authorize_source_execution",
+        lambda *args, **kwargs: object(),
+    )
+
+
 def test_fixture_candidates_load_deterministically():
     candidates, skipped = _load_candidates(FIXTURES / "discovery_candidates.json")
     assert skipped == 0

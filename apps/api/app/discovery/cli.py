@@ -7,6 +7,7 @@ from typing import Any
 from app.database import SessionLocal
 from app.discovery import DiscoveryCandidate, persist_candidates
 from app.discovery.kaggle import KaggleDiscoveryAdapter, KaggleDiscoveryError
+from app.discovery.registry import RegistryError, authorize_source_execution
 
 
 def _load_candidates(path: Path) -> tuple[list[DiscoveryCandidate], int]:
@@ -56,6 +57,8 @@ def main() -> int:
             if args.limit < 1 or not 1 <= args.page_size <= 200:
                 parser.error("--limit must be positive and --page-size must be between 1 and 200")
             max_pages = (args.limit + args.page_size - 1) // args.page_size
+            # Keep an explicit CLI boundary; the adapter repeats this guard for direct callers.
+            authorize_source_execution("kaggle")
             batch = KaggleDiscoveryAdapter(
                 page_size=args.page_size,
                 max_pages=max_pages,
@@ -69,6 +72,9 @@ def main() -> int:
                 parser.error("--allowed-host is required with --input")
             candidates, source_skipped = _load_candidates(args.input)
             allowed_hosts = set(args.allowed_host)
+    except RegistryError as exc:
+        print(f"Discovery authorization refused: {exc}", file=sys.stderr)
+        return 1
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         parser.error(str(exc))
     except KaggleDiscoveryError as exc:
