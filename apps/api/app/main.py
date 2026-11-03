@@ -1,3 +1,4 @@
+from app.auth.router import router as auth_router
 import os
 from datetime import date, datetime
 from typing import Annotated
@@ -19,6 +20,7 @@ from app.models import (
 )
 
 app = FastAPI(title=os.getenv("APP_NAME", "api"))
+app.include_router(auth_router, prefix="/api/v1")
 
 _default_origins = "http://localhost:3000,http://127.0.0.1:3000"
 _origins = [
