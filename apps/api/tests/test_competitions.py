@@ -51,11 +51,15 @@ def client() -> TestClient:
     return TestClient(app)
 
 
+def _published_competition(**values) -> Competition:
+    return Competition(is_published=True, **values)
+
+
 def _add_competitions(session: Session) -> tuple[int, int, int]:
     hidden_without_title = Competition(title=None)
     hidden_candidate = Competition(title=None)
-    second_visible = Competition(title="Visible competition B")
-    first_visible = Competition(title="Visible competition A")
+    second_visible = _published_competition(title="Visible competition B")
+    first_visible = _published_competition(title="Visible competition A")
     session.add_all(
         [hidden_without_title, hidden_candidate, second_visible, first_visible]
     )
@@ -92,7 +96,7 @@ def test_competitions_only_returns_canonical_titles_and_is_ordered(db_session, c
     ids = [item["id"] for item in payload["items"]]
     expected_ids = db_session.scalars(
         select(Competition.id)
-        .where(Competition.title.is_not(None))
+        .where(Competition.is_published.is_(True), Competition.title.is_not(None))
         .order_by(Competition.discovered_at.desc(), Competition.id.desc())
         .limit(100)
     ).all()
@@ -114,6 +118,20 @@ def test_competitions_only_returns_canonical_titles_and_is_ordered(db_session, c
     }
 
 
+def test_unpublished_competition_is_excluded_from_list_and_detail(db_session, client):
+    unpublished = Competition(title="Reviewed but unpublished")
+    db_session.add(unpublished)
+    db_session.flush()
+
+    listed = client.get("/competitions", params={"q": "Reviewed but unpublished"})
+    detailed = client.get(f"/competitions/{unpublished.id}")
+
+    assert listed.status_code == 200
+    assert listed.json()["items"] == []
+    assert listed.json()["total"] == 0
+    assert detailed.status_code == 404
+
+
 def test_competitions_pagination_defaults_and_limits(db_session, client):
     _add_competitions(db_session)
 
@@ -133,8 +151,8 @@ def test_competitions_pagination_defaults_and_limits(db_session, client):
 
 
 def test_competitions_search_matches_title_and_description_case_insensitively(db_session, client):
-    title_match = Competition(title="Quantum Sprint Challenge")
-    description_match = Competition(
+    title_match = _published_competition(title="Quantum Sprint Challenge")
+    description_match = _published_competition(
         title="Other challenge", description="Build tools for renewable energy"
     )
     db_session.add_all([title_match, description_match])
@@ -148,7 +166,7 @@ def test_competitions_search_matches_title_and_description_case_insensitively(db
 
 
 def test_competitions_search_trims_whitespace_and_empty_query_is_unfiltered(db_session, client):
-    match = Competition(title="Whitespace Search Match")
+    match = _published_competition(title="Whitespace Search Match")
     db_session.add(match)
     db_session.flush()
 
@@ -195,11 +213,11 @@ def test_competitions_search_no_match_and_excludes_candidate_evidence(db_session
 
 
 def test_competitions_search_total_is_before_pagination_and_preserves_order(db_session, client):
-    first = Competition(title="Searchable first")
-    second = Competition(title="Searchable second")
-    third = Competition(title="Searchable third")
-    Competition(title="Unrelated")
-    db_session.add_all([first, second, third])
+    first = _published_competition(title="Searchable first")
+    second = _published_competition(title="Searchable second")
+    third = _published_competition(title="Searchable third")
+    unrelated = _published_competition(title="Unrelated")
+    db_session.add_all([first, second, third, unrelated])
     db_session.flush()
 
     all_matches = client.get("/competitions", params={"q": "Searchable", "limit": 100})
@@ -214,8 +232,8 @@ def test_competitions_search_total_is_before_pagination_and_preserves_order(db_s
 
 def test_competitions_filter_by_category_slug_and_unknown_category(db_session, client):
     category = Category(name="AI Challenges", slug=f"ai-{uuid4().hex}")
-    match = Competition(title="AI competition")
-    unrelated = Competition(title="Other competition")
+    match = _published_competition(title="AI competition")
+    unrelated = _published_competition(title="Other competition")
     db_session.add_all([category, match, unrelated])
     db_session.flush()
     db_session.add(
@@ -235,8 +253,8 @@ def test_competitions_filter_by_category_slug_and_unknown_category(db_session, c
 
 def test_competitions_category_combines_with_search_and_pagination(db_session, client):
     category = Category(name="Climate", slug=f"climate-{uuid4().hex}")
-    matches = [Competition(title=f"Climate Spark {index}") for index in range(3)]
-    nonmatch = Competition(title="Climate unrelated")
+    matches = [_published_competition(title=f"Climate Spark {index}") for index in range(3)]
+    nonmatch = _published_competition(title="Climate unrelated")
     db_session.add_all([category, *matches, nonmatch])
     db_session.flush()
     db_session.add_all(
@@ -261,14 +279,18 @@ def test_competitions_category_combines_with_search_and_pagination(db_session, c
 def test_category_counts_include_zero_and_exclude_untitled_competitions(db_session, client):
     populated = Category(name="Counted category", slug=f"counted-{uuid4().hex}")
     empty = Category(name="Empty category", slug=f"empty-{uuid4().hex}")
-    titled = Competition(title="Counted competition")
+    titled = _published_competition(title="Counted competition")
     untitled = Competition(title=None)
-    db_session.add_all([populated, empty, titled, untitled])
+    unpublished = Competition(title="Unpublished category item")
+    db_session.add_all([populated, empty, titled, untitled, unpublished])
     db_session.flush()
     db_session.add_all(
         [
             CompetitionCategory(competition_id=titled.id, category_id=populated.id),
             CompetitionCategory(competition_id=untitled.id, category_id=populated.id),
+            CompetitionCategory(
+                competition_id=unpublished.id, category_id=populated.id
+            ),
         ]
     )
     db_session.flush()
@@ -323,7 +345,7 @@ def test_competition_detail_returns_canonical_fields_and_public_relationships(
     db_session, client
 ):
     slug = f"test-category-{uuid4().hex}"
-    competition = Competition(
+    competition = _published_competition(
         title="Reviewed competition",
         description="Canonical overview.",
         eligibility_summary="Open to students.",
@@ -435,7 +457,7 @@ def test_competition_detail_returns_not_found_for_missing_or_untitled_rows(
 
 
 def test_competition_detail_omits_invalid_external_urls(db_session, client):
-    competition = Competition(
+    competition = _published_competition(
         title="Canonical title",
         official_url="javascript:alert(1)",
     )

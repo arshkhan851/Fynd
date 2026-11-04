@@ -165,6 +165,25 @@ def test_accepting_evidence_updates_only_its_mapped_canonical_field(db_session):
     assert competition.title is None
 
 
+def test_accepting_title_evidence_does_not_publish_unpublished_competition(db_session):
+    competition = Competition(title=None, is_published=False)
+    db_session.add(competition)
+    db_session.flush()
+    _, evidence = _add_source_and_evidence(
+        db_session,
+        competition,
+        value={"title": "Reviewed but unpublished"},
+        field_name="title",
+        suffix="unpublished-title",
+    )
+
+    accept_evidence(db_session, evidence.id)
+
+    db_session.refresh(competition)
+    assert competition.title == "Reviewed but unpublished"
+    assert competition.is_published is False
+
+
 def test_accepting_replacement_supersedes_prior_selection_and_keeps_both(db_session):
     competition = Competition(title="Previous title")
     db_session.add(competition)

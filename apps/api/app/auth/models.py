@@ -1,10 +1,11 @@
 import uuid
-from datetime import datetime, timezone
-from sqlalchemy import String, Boolean, DateTime, ForeignKey, Index, Text, UniqueConstraint, func
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-# Exact match to your existing convention
-from app.database import Base 
+from app.database import Base
+
 
 class User(Base):
     __tablename__ = "users"
@@ -37,6 +38,7 @@ class EmailAuthToken(Base):
     
     token_hash: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -53,7 +55,9 @@ class UserSession(Base):
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     
-    session_token_hash: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    session_token_hash: Mapped[str] = mapped_column(
+        String(255), unique=True, index=True, nullable=False
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     is_revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     

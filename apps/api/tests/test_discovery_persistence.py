@@ -55,6 +55,7 @@ def test_repeat_source_urls_are_idempotent(db_session):
         )
     )
     assert db_session.get(Competition, competition_id).title is None
+    assert db_session.get(Competition, competition_id).is_published is True
     matching_sources = select(CompetitionSource.id).where(
         CompetitionSource.normalized_url == url
     )

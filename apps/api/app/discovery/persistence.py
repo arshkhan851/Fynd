@@ -85,7 +85,11 @@ def persist_candidates(
 
                     # A discovered title is only a candidate until an operator
                     # explicitly accepts its field evidence.
-                    competition = Competition()
+                    # Discovery rows have no canonical title yet, so the public
+                    # title filter keeps them hidden. Preserve the existing
+                    # behavior that human title acceptance can make these rows
+                    # visible, without changing publication during review.
+                    competition = Competition(is_published=True)
                     session.add(competition)
                     session.flush()
                     source = CompetitionSource(

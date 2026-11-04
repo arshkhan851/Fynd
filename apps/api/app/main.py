@@ -1,4 +1,3 @@
-from app.auth.router import router as auth_router
 import os
 from datetime import date, datetime
 from typing import Annotated
@@ -10,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.auth.router import router as auth_router
 from app.database import check_database_connectivity, get_db
 from app.models import (
     Category,
@@ -18,9 +18,13 @@ from app.models import (
     CompetitionOrganizer,
     CompetitionSource,
 )
+from app.submissions.admin_router import router as admin_submissions_router
+from app.submissions.router import router as submissions_router
 
 app = FastAPI(title=os.getenv("APP_NAME", "api"))
 app.include_router(auth_router, prefix="/api/v1")
+app.include_router(submissions_router, prefix="/api/v1")
+app.include_router(admin_submissions_router, prefix="/api/v1")
 
 _default_origins = "http://localhost:3000,http://127.0.0.1:3000"
 _origins = [
@@ -32,8 +36,9 @@ _origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
-    allow_methods=["GET"],
-    allow_headers=[],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+    allow_credentials=True,
 )
 
 
@@ -151,7 +156,7 @@ def list_competitions(
     q: Annotated[str | None, Query()] = None,
     category: Annotated[str | None, Query()] = None,
 ) -> CompetitionListResponse:
-    visible_competitions = Competition.title.is_not(None)
+    visible_competitions = Competition.is_published.is_(True) & Competition.title.is_not(None)
     search_term = q.strip() if q else ""
     filters = [visible_competitions]
     if search_term:
@@ -209,7 +214,10 @@ def list_categories(session: Annotated[Session, Depends(get_db)]) -> list[Catego
             func.count(CompetitionCategory.competition_id).label("competition_count"),
         )
         .join(Competition, Competition.id == CompetitionCategory.competition_id)
-        .where(Competition.title.is_not(None))
+        .where(
+            Competition.is_published.is_(True),
+            Competition.title.is_not(None),
+        )
         .group_by(CompetitionCategory.category_id)
         .subquery()
     )
@@ -245,6 +253,7 @@ def get_competition(
         select(Competition)
         .where(
             Competition.id == competition_id,
+            Competition.is_published.is_(True),
             Competition.title.is_not(None),
         )
         .options(

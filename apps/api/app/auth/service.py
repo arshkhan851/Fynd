@@ -1,10 +1,11 @@
 import hashlib
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from app.auth.email_address import normalize_email
 from app.auth.models import EmailAuthToken, User, UserSession
 
 TOKEN_LIFETIME_MINUTES = 15
@@ -21,25 +22,34 @@ def generate_magic_link_token(db: Session, email: str) -> str:
     Finds or creates a user by email, invalidates any existing active magic links,
     and returns a raw cryptographic token to be sent via email.
     """
-    # 1. Find or create the user
-    user = db.scalar(select(User).where(User.email == email))
+    normalized_email = normalize_email(email)
+    # Match legacy mixed-case rows without changing their stored addresses.
+    user = db.scalar(
+        select(User).where(func.lower(User.email) == normalized_email).with_for_update()
+    )
     if not user:
-        user = User(email=email)
+        user = User(email=normalized_email)
         db.add(user)
         db.flush()  # Flush to get the new user.id
 
     # 2. Invalidate existing outstanding tokens to prevent race conditions or abuse
+    now = datetime.now(UTC)
     db.execute(
         update(EmailAuthToken)
-        .where(EmailAuthToken.user_id == user.id)
-        .values(expires_at=datetime.now(timezone.utc))
+        .where(
+            EmailAuthToken.user_id == user.id,
+            EmailAuthToken.used_at.is_(None),
+            EmailAuthToken.expires_at > now,
+        )
+        .values(expires_at=now, used_at=now)
+        .execution_options(synchronize_session=False)
     )
 
     # 3. Generate a new cryptographically secure token
     raw_token = secrets.token_urlsafe(32)
     token_hash = _hash_token(raw_token)
 
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_LIFETIME_MINUTES)
+    expires_at = now + timedelta(minutes=TOKEN_LIFETIME_MINUTES)
 
     auth_token = EmailAuthToken(
         user_id=user.id,
@@ -59,29 +69,55 @@ def verify_magic_token_and_create_session(db: Session, raw_token: str) -> str | 
     """
     token_hash = _hash_token(raw_token)
 
-    # 1. Find a valid, unexpired token
-    stmt = select(EmailAuthToken).where(
-        EmailAuthToken.token_hash == token_hash,
-        EmailAuthToken.expires_at > datetime.now(timezone.utc),
-    )
-    auth_token = db.scalar(stmt)
+    now = datetime.now(UTC)
+    try:
+        # A conditional UPDATE is the atomic claim. Under PostgreSQL's row locking,
+        # concurrent verifiers serialize and only the first can match used_at IS NULL.
+        claimed_user_id = db.execute(
+            update(EmailAuthToken)
+            .where(
+                EmailAuthToken.token_hash == token_hash,
+                EmailAuthToken.expires_at > now,
+                EmailAuthToken.used_at.is_(None),
+            )
+            .values(used_at=now)
+            .returning(EmailAuthToken.user_id)
+            .execution_options(synchronize_session=False)
+        ).scalar_one_or_none()
+        if claimed_user_id is None:
+            db.rollback()
+            return None
 
-    if not auth_token:
-        return None
+        raw_session_token = secrets.token_urlsafe(32)
+        user_session = UserSession(
+            user_id=claimed_user_id,
+            session_token_hash=_hash_token(raw_session_token),
+            expires_at=now + timedelta(days=SESSION_LIFETIME_DAYS),
+        )
+        db.add(user_session)
+        db.commit()
+        return raw_session_token
+    except Exception:
+        # Consumption and session creation are one transaction: a failed insert or
+        # commit must leave the token available for a later valid attempt.
+        db.rollback()
+        raise
 
-    # 2. Invalidate the token so it cannot be used again
-    auth_token.expires_at = datetime.now(timezone.utc)
 
-    # 3. Create a new user session
-    raw_session_token = secrets.token_urlsafe(32)
-    session_hash = _hash_token(raw_session_token)
+def revoke_session(db: Session, raw_session_token: str) -> None:
+    """Revoke the session represented by a presented raw cookie token.
 
-    user_session = UserSession(
-        user_id=auth_token.user_id,
-        session_token_hash=session_hash,
-        expires_at=datetime.now(timezone.utc) + timedelta(days=SESSION_LIFETIME_DAYS),
-    )
-    db.add(user_session)
-    db.commit()
-
-    return raw_session_token
+    The database stores only the token hash. Updating by that unique hash makes
+    repeated revocation harmless and does not reveal whether a row matched.
+    """
+    try:
+        db.execute(
+            update(UserSession)
+            .where(UserSession.session_token_hash == _hash_token(raw_session_token))
+            .values(is_revoked=True)
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise

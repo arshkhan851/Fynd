@@ -256,8 +256,12 @@ def get_competition_detail(session: Session, competition_id: int) -> dict[str, A
     return result
 
 
-def accept_evidence(session: Session, evidence_id: int) -> FieldEvidence:
-    with _transaction(session), session.begin_nested():
+def accept_evidence(session: Session, evidence_id: int, *, commit: bool = True) -> FieldEvidence:
+    """Accept candidate evidence, optionally leaving the root transaction to its caller."""
+    if not commit and not session.in_transaction():
+        raise ReviewError("caller-managed evidence acceptance requires an active transaction")
+    transaction = _transaction(session) if commit else nullcontext()
+    with transaction, session.begin_nested():
         evidence = session.scalar(
             select(FieldEvidence).where(FieldEvidence.id == evidence_id).with_for_update()
         )
