@@ -47,20 +47,20 @@ The database port is available only on `127.0.0.1:5432`; data persists in the na
 3. .\.venv\Scripts\python -m pip install -r requirements.txt
 4. Run database migrations from the API directory: .\.venv\Scripts\alembic upgrade head
 5. Run: .\.venv\Scripts\python -m uvicorn app.main:app --reload
-6. Open http://127.0.0.1:8000/health or http://127.0.0.1:8000/health/db
+6. Open http://localhost:8000/health or http://localhost:8000/health/db
 7. Test: .\.venv\Scripts\python -m pytest
 
 ### Competition listing API
 `GET /competitions` returns competitions with a non-null canonical title, ordered by discovery time newest first and ID descending as a tie-breaker. It does not substitute pending evidence titles. The optional `q` parameter is trimmed and performs case-insensitive partial matching against canonical `title` and `description` columns only; empty and whitespace-only values behave like no search. The optional `category` parameter filters by an exact category slug. These filters can be combined. Candidate evidence is never searched. Pagination uses `limit` (default `20`, minimum `1`, maximum `100`) and `offset` (default `0`, minimum `0`). The response contains `items`, `total`, `limit`, and `offset`; `total` counts all matching competitions before pagination. Each item contains `id`, `title`, `format`, `official_url`, `event_starts_on`, `event_starts_at`, `registration_deadline_on`, and `registration_deadline_at`.
 
-`GET /categories` returns categories ordered by name (case-insensitive), with `name`, `slug`, and `competition_count`. Counts include only competitions with a canonical non-null title, and categories with no eligible competitions are returned with a count of `0`.
+`GET /categories` returns categories ordered by name (case-insensitive), with the numeric `id`, `name`, `slug`, and `competition_count`. Counts include only competitions with a canonical non-null title, and categories with no eligible competitions are returned with a count of `0`.
 
 `GET /competitions/{id}` returns `id`, `title`, `description`, `eligibility_summary`, `format`, official and registration URLs, registration/event dates, and `event_timezone`. Its public relationships are `categories` (`name`, `slug`, `is_primary`), `organizers` (`name`, `role`, `website_url`), `prizes` (`award_name`, `place`, decimal `amount` as a string, `currency`, `details`), and `sources` (`source_kind`, `source_url`, `publisher_name`, `publisher_homepage_url`). It returns `404` for missing competitions or records without a canonical title. Candidate, rejected, and superseded evidence is never returned or used as a fallback. External URLs are limited to credential-free HTTP(S) links. Source check status and verification timestamps are not exposed.
 
 The web app requests the first page with `limit=20` from `API_BASE_URL`. Set `API_BASE_URL` in `apps\web\.env.local` to the API base URL; the local development value is:
 
 ```dotenv
-API_BASE_URL=http://127.0.0.1:8000
+API_BASE_URL=http://localhost:8000
 ```
 
 ### Kaggle discovery

@@ -5,6 +5,11 @@ import { useRouter } from "next/navigation";
 import { FormEvent, useEffect, useState } from "react";
 
 import { CompetitionCategoryOption } from "@/lib/competitions";
+import {
+  isValidCategorySelection,
+  toggleCategory,
+  type CategorySelection,
+} from "@/lib/category-selection";
 import { CURRENT_CONSENT_DECLARATION_TEXT } from "@/lib/submission-consent";
 import { createSubmission, getCurrentUser } from "@/lib/submissions";
 
@@ -31,6 +36,10 @@ export function SubmissionForm({ apiBaseUrl, categories, categoryError }: Props)
   const router = useRouter();
   const [userState, setUserState] = useState<"loading" | "signed-out" | "signed-in" | "error">("loading");
   const [values, setValues] = useState(initial);
+  const [categorySelection, setCategorySelection] = useState<CategorySelection>({
+    selectedIds: [],
+    primaryId: null,
+  });
   const [accepted, setAccepted] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState("");
@@ -63,6 +72,9 @@ export function SubmissionForm({ apiBaseUrl, categories, categoryError }: Props)
         next.registration_fee_currency = "Enter a 3-letter currency code, such as INR.";
       }
     }
+    if (!isValidCategorySelection(categorySelection)) {
+      next.primary_category_id = "Choose exactly one primary category from your selections.";
+    }
     if (!accepted) next.consent = "Accept the permission declaration to submit.";
     setErrors(next);
     return Object.keys(next).length === 0;
@@ -92,8 +104,8 @@ export function SubmissionForm({ apiBaseUrl, categories, categoryError }: Props)
           registration_fee_amount: values.registration_fee_amount,
           registration_fee_currency: values.registration_fee_currency.toUpperCase(),
         } : {}),
-        category_ids: [],
-        primary_category_id: null,
+        category_ids: categorySelection.selectedIds,
+        primary_category_id: categorySelection.primaryId,
         consentAccepted: true,
       });
       if (submission.status !== "pending") throw new Error("The submission response had an unexpected status. Please contact support.");
@@ -151,8 +163,15 @@ export function SubmissionForm({ apiBaseUrl, categories, categoryError }: Props)
 
       <section className="submission-section" aria-labelledby="categories-info"><p className="eyebrow">05 / Categories</p><h2 id="categories-info">Help participants find it</h2>
         {categoryError ? <p className="field-error" role="alert">{categoryError}</p> : categories.length === 0 ? <p className="submission-hint">No categories are currently available. You may submit without one.</p> : <>
-          <p className="submission-hint">Categories are available, but the current public categories response does not include the IDs required by the submission API. Submit without categories for now.</p>
-          <ul className="submission-category-list">{categories.map((category) => <li key={category.slug}>{category.name}</li>)}</ul>
+          <fieldset className="category-options"><legend>Select all that apply</legend>{categories.map((category) => {
+            const selected = categorySelection.selectedIds.includes(category.id);
+            return <div className="category-option" key={category.id}>
+              <label><input type="checkbox" checked={selected} onChange={() => setCategorySelection((current) => toggleCategory(current, category.id))} />{category.name}</label>
+              {selected && <label className="category-primary"><input type="radio" name="primary-category" checked={categorySelection.primaryId === category.id} onChange={() => setCategorySelection((current) => ({ ...current, primaryId: category.id }))} />Primary</label>}
+            </div>;
+          })}</fieldset>
+          <p className="submission-hint">Choose one primary category from your selections.</p>
+          {errors.primary_category_id && <small className="field-error" role="alert">{errors.primary_category_id}</small>}
         </>}
       </section>
 

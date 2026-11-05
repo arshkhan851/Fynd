@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -9,6 +10,8 @@ from fastapi.testclient import TestClient
 from app.auth.models import User, UserSession
 from app.auth.router import router
 from app.database import get_db
+
+auth_router_module = importlib.import_module("app.auth.router")
 
 
 class FakeAuthSession:
@@ -132,3 +135,30 @@ def test_logout_requires_authentication():
     client = _client(FakeAuthSession(raw_token="logout-cookie", user=_user()))
 
     assert client.post("/api/v1/auth/logout").status_code == 401
+
+
+def test_magic_link_verification_sets_session_cookie_and_replay_is_rejected(monkeypatch):
+    responses = iter(("new-session-token", None))
+    monkeypatch.setattr(
+        auth_router_module,
+        "verify_magic_token_and_create_session",
+        lambda db, raw_token: next(responses),
+    )
+    client = _client(FakeAuthSession(raw_token="unused-token", user=_user()))
+
+    verified = client.post("/api/v1/auth/verify", json={"token": "single-use-token"})
+
+    assert verified.status_code == 200
+    cookie = verified.headers["set-cookie"].lower()
+    assert "fynd_session=new-session-token" in cookie
+    assert "httponly" in cookie
+    assert "secure" in cookie
+    assert "samesite=lax" in cookie
+    assert "path=/" in cookie
+    assert "max-age=2592000" in cookie
+    assert "domain=" not in cookie
+
+    replay = client.post("/api/v1/auth/verify", json={"token": "single-use-token"})
+
+    assert replay.status_code == 401
+    assert "set-cookie" not in replay.headers

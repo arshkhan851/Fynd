@@ -61,6 +61,7 @@ class CompetitionListResponse(BaseModel):
 
 
 class CategoryCount(BaseModel):
+    id: int
     name: str
     slug: str
     competition_count: int
@@ -223,6 +224,7 @@ def list_categories(session: Annotated[Session, Depends(get_db)]) -> list[Catego
     )
     statement = (
         select(
+            Category.id,
             Category.name,
             Category.slug,
             func.coalesce(eligible_counts.c.competition_count, 0).label("competition_count"),

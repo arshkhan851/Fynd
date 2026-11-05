@@ -581,8 +581,10 @@ button:focus-visible {
 .submission-hint { margin: -3px 0 17px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .field-error { display: block; margin: -10px 0 14px; color: #963e27; font-size: 12px; }
 .category-options { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 0 0 20px; padding: 15px; border: 1px solid var(--line); }
+.category-option { display: flex; align-items: center; gap: 14px; }
 .category-options legend { padding: 0 6px; color: var(--muted); font-size: 12px; }
 .category-options label, .consent-check { display: flex; align-items: flex-start; gap: 9px; color: #4d4e45; font-size: 13px; line-height: 1.5; }
+.category-options .category-primary { color: var(--muted); font-size: 11px; }
 .category-options input, .consent-check input { width: 17px; height: 17px; accent-color: #75881d; }
 .submission-category-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .submission-category-list li { padding: 6px 10px; border: 1px solid var(--line); font-size: 11px; }

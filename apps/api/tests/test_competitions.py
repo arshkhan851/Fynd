@@ -300,6 +300,7 @@ def test_category_counts_include_zero_and_exclude_untitled_competitions(db_sessi
     category_results = client.get("/competitions", params={"category": populated.slug})
 
     assert by_slug[populated.slug] == {
+        "id": populated.id,
         "name": "Counted category",
         "slug": populated.slug,
         "competition_count": 1,

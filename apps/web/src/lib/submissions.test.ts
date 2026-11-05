@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { toggleCategory } from "./category-selection";
 import { createSubmission, getCurrentUser, requestMagicLink, verifyMagicLink, verifyMagicLinkOnce } from "./submissions";
 import { CURRENT_CONSENT_DECLARATION_TEXT, CURRENT_CONSENT_DECLARATION_VERSION } from "./submission-consent";
 
@@ -38,19 +39,23 @@ describe("submission API client", () => {
 
   it("sends the exact current consent declaration and event schema", async () => {
     const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ id: 8, status: "pending", title: "Campus Hack" }, { status: 201 }));
+    let selection = { selectedIds: [] as number[], primaryId: null as number | null };
+    selection = toggleCategory(selection, 37);
+    selection = toggleCategory(selection, 52);
+    selection = { ...selection, primaryId: 52 };
     await createSubmission("http://api.test", {
       title: "Campus Hack", description: "Build things", organizer_name: "Club",
       organizer_email: "club@example.org", official_url: "https://club.example.org",
       registration_url: "https://club.example.org/register", format: "online",
       registration_deadline_on: "2026-12-01", event_starts_on: "2026-12-05",
       event_ends_on: "2026-12-06", registration_price_status: "free",
-      category_ids: [], primary_category_id: null, consentAccepted: true,
+      category_ids: selection.selectedIds, primary_category_id: selection.primaryId, consentAccepted: true,
     });
     const request = fetch.mock.calls[0][1];
     const body = JSON.parse(String(request?.body));
     expect(fetch.mock.calls[0][0]).toEqual(new URL("http://api.test/api/v1/submissions"));
     expect(body).toMatchObject({
-      category_ids: [], primary_category_id: null,
+      category_ids: [37, 52], primary_category_id: 52,
       consent: { declaration_version: CURRENT_CONSENT_DECLARATION_VERSION, declaration_text: CURRENT_CONSENT_DECLARATION_TEXT },
     });
     expect(body.submitter_user_id).toBeUndefined();

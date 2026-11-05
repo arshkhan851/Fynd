@@ -17,6 +17,7 @@ export type CompetitionPage = {
 };
 
 export type CompetitionCategoryOption = {
+  id: number;
   name: string;
   slug: string;
   competition_count: number;
@@ -253,6 +254,8 @@ export async function getCompetitionCategories(
         (entry) =>
           typeof entry === "object" &&
           entry !== null &&
+          Number.isSafeInteger((entry as Record<string, unknown>).id) &&
+          ((entry as Record<string, unknown>).id as number) > 0 &&
           typeof (entry as Record<string, unknown>).name === "string" &&
           typeof (entry as Record<string, unknown>).slug === "string" &&
           typeof (entry as Record<string, unknown>).competition_count === "number",

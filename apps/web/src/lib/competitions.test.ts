@@ -120,10 +120,10 @@ describe("getCompetitions", () => {
 });
 
 describe("getCompetitionCategories", () => {
-  it("loads category names, slugs, and competition counts", async () => {
+  it("loads category IDs, names, slugs, and competition counts", async () => {
     const categories = [
-      { name: "Climate", slug: "climate", competition_count: 4 },
-      { name: "Empty", slug: "empty", competition_count: 0 },
+      { id: 17, name: "Climate", slug: "climate", competition_count: 4 },
+      { id: 23, name: "Empty", slug: "empty", competition_count: 0 },
     ];
     const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json(categories));
 
@@ -149,6 +149,16 @@ describe("getCompetitionCategories", () => {
     expect(await getCompetitionCategories("http://api.test")).toEqual({
       status: "error",
       message: "API returned HTTP 503",
+    });
+  });
+
+  it("rejects category responses without a numeric canonical ID", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json([
+      { name: "Climate", slug: "climate", competition_count: 4 },
+    ]));
+    expect(await getCompetitionCategories("http://api.test")).toEqual({
+      status: "error",
+      message: "Unexpected response from API",
     });
   });
 });
