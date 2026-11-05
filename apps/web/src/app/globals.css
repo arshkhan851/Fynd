@@ -610,6 +610,46 @@ button:focus-visible {
 .status-pill--pending, .status-pill--under_review { background: #f3efcc; }
 .status-pill--approved { background: #e4edbc; }
 .status-pill--rejected, .status-pill--withdrawn { background: #efe2dc; }
+.admin-page .editorial-heading { margin-bottom: 30px; font-size: clamp(42px, 7vw, 70px); }
+.admin-queue-heading { display: flex; align-items: flex-end; justify-content: space-between; margin: 38px 0 18px; padding-top: 24px; border-top: 1px solid var(--line); }
+.admin-queue-heading .eyebrow { margin-bottom: 8px; }
+.admin-queue-heading h2 { margin: 0; font: 400 27px Georgia, "Times New Roman", serif; }
+.admin-queue { margin: 0; padding: 0; border-top: 1px solid var(--line); list-style: none; }
+.admin-queue li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 18px 26px; padding: 22px 10px; border-bottom: 1px solid var(--line); }
+.admin-queue__main { min-width: 0; }
+.admin-queue__main h3 { margin: 0; font: 400 clamp(21px, 3vw, 29px) Georgia, "Times New Roman", serif; }
+.admin-queue__main p { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
+.admin-review-link { color: var(--ink); font-size: 12px; text-decoration: underline; text-underline-offset: 4px; }
+.admin-pagination { display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 20px 0; color: var(--muted); font-size: 12px; }
+.admin-pagination button { padding: 9px 12px; border: 1px solid var(--line); background: transparent; color: var(--ink); cursor: pointer; font: inherit; }
+.admin-pagination button:disabled { cursor: default; opacity: .45; }
+.admin-review-page .back-link { margin: 0 0 30px; }
+.admin-review-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 8px 0 35px; border-bottom: 1px solid var(--line); }
+.admin-review-header .editorial-heading { max-width: 850px; font-size: clamp(40px, 7vw, 74px); overflow-wrap: anywhere; }
+.admin-review-subtitle { margin: 16px 0 0; color: var(--muted); font-size: 13px; }
+.admin-detail-section { padding: 30px 0; border-bottom: 1px solid var(--line); }
+.admin-detail-section .eyebrow { margin-bottom: 8px; }
+.admin-detail-section h2 { margin: 0 0 20px; font: 400 29px Georgia, "Times New Roman", serif; }
+.admin-description { color: #55574e; line-height: 1.75; white-space: pre-line; }
+.admin-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px; margin: 24px 0 0; }
+.admin-detail-item { min-width: 0; padding: 14px 0; border-top: 1px solid var(--line); }
+.admin-detail-item dt { margin-bottom: 6px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.admin-detail-item dd { margin: 0; overflow-wrap: anywhere; font-size: 13px; line-height: 1.5; }
+.admin-category-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.admin-category-list li { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid var(--line); font-size: 12px; }
+.admin-category-list span { color: #68791e; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.admin-review-events { display: grid; gap: 12px; margin: 0; padding-left: 22px; }
+.admin-review-events li { display: grid; gap: 6px; padding: 12px 0; color: #55574e; font-size: 13px; }
+.admin-review-events span { color: var(--muted); font-size: 11px; }
+.admin-review-events p { margin: 0; line-height: 1.6; }
+.admin-review-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; align-items: start; }
+.admin-review-actions form, .admin-approve-action { display: grid; gap: 12px; }
+.admin-review-actions label { font-size: 13px; font-weight: 600; }
+.admin-review-actions textarea { min-height: 120px; width: 100%; padding: 12px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); font: inherit; resize: vertical; }
+.admin-review-actions button { justify-self: start; }
+.admin-review-actions button:disabled { cursor: wait; opacity: .6; }
+.admin-approve-action p { margin: 0; color: var(--muted); font-size: 13px; }
+.admin-review-actions .field-error { margin: -6px 0 0; color: #9f3226; font-size: 12px; }
 
 @media (max-width: 700px) {
   .site-header__inner,
@@ -648,6 +688,12 @@ button:focus-visible {
   .submission-actions { align-items: stretch; flex-direction: column; }
   .submission-actions .filter-submit { width: 100%; }
   .submission-list li { align-items: flex-start; flex-direction: column; }
+  .admin-queue li { grid-template-columns: minmax(0, 1fr) auto; }
+  .admin-queue li .status-pill { justify-self: end; }
+  .admin-queue li .admin-review-link { grid-column: 1 / -1; }
+  .admin-detail-grid { grid-template-columns: 1fr; }
+  .admin-review-header { flex-direction: column; }
+  .admin-review-actions { grid-template-columns: 1fr; }
 
   .filter-field {
     min-width: 0;
