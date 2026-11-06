@@ -5,3 +5,44 @@ __pycache__/
 .env
 node_modules/
 .next/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Credentials
+credentials.json
+secrets.json
+service-account*.json
+
+# Local configuration
+secrets/
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+service-account*.json
+**/.next/
+**/node_modules/
+
+# Generated and local development files
+**/.venv/
+**/venv/
+**/.next/
+**/node_modules/
+__pycache__/
+*.py[cod]
