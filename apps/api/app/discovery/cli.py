@@ -16,14 +16,21 @@ def _load_candidates(path: Path) -> tuple[list[DiscoveryCandidate], int]:
         raise ValueError("input JSON must be an array of candidate objects")
     candidates: list[DiscoveryCandidate] = []
     skipped = 0
-    for item in payload:
+    for candidate_index, item in enumerate(payload, start=1):
         if not isinstance(item, dict):
             skipped += 1
             continue
         try:
-            candidates.append(DiscoveryCandidate(**item))
+            candidate = DiscoveryCandidate(**item)
         except (TypeError, ValueError):
             skipped += 1
+            continue
+        if candidate.source_kind == "organizer":
+            raise ValueError(
+                f"candidate {candidate_index} cannot claim source_kind='organizer'; "
+                "use the organizer submission workflow"
+            )
+        candidates.append(candidate)
     return candidates, skipped
 
 

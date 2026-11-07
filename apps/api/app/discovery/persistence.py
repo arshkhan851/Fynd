@@ -83,13 +83,10 @@ def persist_candidates(
                         session.add(publisher)
                         session.flush()
 
-                    # A discovered title is only a candidate until an operator
-                    # explicitly accepts its field evidence.
-                    # Discovery rows have no canonical title yet, so the public
-                    # title filter keeps them hidden. Preserve the existing
-                    # behavior that human title acceptance can make these rows
-                    # visible, without changing publication during review.
-                    competition = Competition(is_published=True)
+                    # Discovery and manual-import records remain private even
+                    # after evidence review. This persistence path does not
+                    # make publication decisions.
+                    competition = Competition(is_published=False)
                     session.add(competition)
                     session.flush()
                     source = CompetitionSource(

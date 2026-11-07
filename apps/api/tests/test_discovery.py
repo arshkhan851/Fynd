@@ -10,7 +10,7 @@ from kagglesdk.competitions.types.competition_api_service import (
     ApiListCompetitionsResponse,
 )
 
-from app.discovery import DiscoveryCandidate
+from app.discovery import DiscoveryCandidate, cli
 from app.discovery.cli import _load_candidates
 from app.discovery.http import BoundedHttpClient, FetchError
 from app.discovery.kaggle import (
@@ -230,6 +230,41 @@ def test_candidate_loader_counts_malformed_entries(tmp_path):
     candidates, skipped = _load_candidates(source)
     assert candidates == []
     assert skipped == 5
+
+
+def test_json_import_rejects_organizer_source_kind_before_persistence(
+    tmp_path, monkeypatch, capsys
+):
+    source = tmp_path / "organizer-candidate.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "title": "Claimed organizer event",
+                    "source_url": "https://events.example.test/event",
+                    "publisher_name": "Unverified organizer",
+                    "source_kind": "organizer",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["fynd-discovery", "--input", str(source), "--allowed-host", "example.test"],
+    )
+
+    def persistence_must_not_run(*args, **kwargs):
+        pytest.fail("organizer JSON candidate reached persistence")
+
+    monkeypatch.setattr(cli, "persist_candidates", persistence_must_not_run)
+    monkeypatch.setattr(cli, "SessionLocal", persistence_must_not_run)
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+
+    assert error.value.code == 2
+    assert "candidate 1 cannot claim source_kind='organizer'" in capsys.readouterr().err
 
 
 def _kaggle_competition(title, url, ref):

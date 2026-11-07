@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal, engine
 from app.discovery import DiscoveryCandidate, persist_candidates, persistence
 from app.models import Competition, CompetitionSource, FieldEvidence, SourcePublisher
+from app.review.service import accept_evidence
 
 
 @pytest.fixture
@@ -55,7 +56,7 @@ def test_repeat_source_urls_are_idempotent(db_session):
         )
     )
     assert db_session.get(Competition, competition_id).title is None
-    assert db_session.get(Competition, competition_id).is_published is True
+    assert db_session.get(Competition, competition_id).is_published is False
     matching_sources = select(CompetitionSource.id).where(
         CompetitionSource.normalized_url == url
     )
@@ -93,6 +94,56 @@ def test_repeat_source_urls_are_idempotent(db_session):
     assert source is not None
     assert evidence.competition_id == source.competition_id
     assert evidence.source_id == source.id
+
+
+def test_manual_import_creates_unpublished_competition(db_session):
+    source_url = "https://events.example.test/2027/private-import"
+    summary = persist_candidates(
+        db_session,
+        [DiscoveryCandidate("Imported event", source_url, "Example Events")],
+        {"example.test"},
+    )
+
+    assert summary.discovered == 1
+    competition_id = db_session.scalar(
+        select(CompetitionSource.competition_id).where(
+            CompetitionSource.normalized_url == source_url
+        )
+    )
+    competition = db_session.get(Competition, competition_id)
+    assert competition is not None
+    assert competition.title is None
+    assert competition.is_published is False
+
+
+def test_accepting_imported_title_evidence_does_not_publish_competition(db_session):
+    source_url = "https://events.example.test/2027/imported-title-review"
+    summary = persist_candidates(
+        db_session,
+        [DiscoveryCandidate("Reviewed imported event", source_url, "Example Events")],
+        {"example.test"},
+    )
+    assert summary.discovered == 1
+    evidence = db_session.scalar(
+        select(FieldEvidence).join(CompetitionSource).where(
+            CompetitionSource.normalized_url == source_url,
+            FieldEvidence.field_name == "title",
+        )
+    )
+    competition = db_session.scalar(
+        select(Competition).join(CompetitionSource).where(
+            CompetitionSource.normalized_url == source_url
+        )
+    )
+    assert evidence is not None
+    assert competition is not None
+    assert competition.is_published is False
+
+    accept_evidence(db_session, evidence.id, commit=False)
+
+    db_session.refresh(competition)
+    assert competition.title == "Reviewed imported event"
+    assert competition.is_published is False
 
 
 def test_lock_key_collision_does_not_deduplicate_different_urls(db_session, monkeypatch):
