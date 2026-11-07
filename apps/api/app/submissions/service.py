@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import select
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.email_address import normalize_email
 from app.auth.models import User
+from app.discovery.urls import UnsafeSourceUrl, normalize_source_url
 from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS
 from app.models import (
     Category,
@@ -42,6 +44,113 @@ class SubmissionValidationError(ValueError):
 
 class SubmissionAuthorizationError(SubmissionValidationError):
     """The authenticated user cannot submit under the selected organizer profile."""
+
+
+def _validate_consent_record(
+    consent: SubmissionConsent | None, submission: OrganizerSubmission
+) -> None:
+    """Validate the immutable consent snapshot linked to a submission."""
+    if (
+        consent is None
+        or consent.submitter_user_id != submission.submitter_user_id
+        or consent.submission_id != submission.id
+        or not isinstance(consent.declaration_version, str)
+        or not consent.declaration_version.strip()
+        or not isinstance(consent.declaration_text, str)
+        or not consent.declaration_text
+        or not isinstance(consent.accepted_at, datetime)
+        or consent.accepted_at.tzinfo is None
+        or consent.accepted_at.utcoffset() is None
+        or sha256(consent.declaration_text.encode("utf-8")).hexdigest()
+        != consent.declaration_sha256
+    ):
+        raise SubmissionValidationError("submission consent record is missing or invalid")
+    try:
+        normalize_email(consent.submitter_email_snapshot)
+    except (TypeError, ValueError) as exc:
+        raise SubmissionValidationError("submission consent email snapshot is invalid") from exc
+
+
+def _normalize_provenance_url(url: str | None) -> str:
+    """Canonicalize a stored organizer URL for identity comparison only.
+
+    The hostname is derived from the URL itself because this check compares
+    provenance and does not perform a fetch or grant network permission.
+    """
+    if not isinstance(url, str):
+        raise SubmissionValidationError("organizer source URL provenance is invalid")
+    try:
+        host = urlsplit(url).hostname
+        if not host:
+            raise UnsafeSourceUrl("URL has no hostname")
+        return normalize_source_url(url, {host})
+    except (ValueError, UnsafeSourceUrl) as exc:
+        raise SubmissionValidationError("organizer source URL provenance is invalid") from exc
+
+
+def _validate_existing_competition_sources(
+    db: Session, competition: Competition
+) -> None:
+    """Require every recorded source to have approved organizer provenance."""
+    sources = db.scalars(
+        select(CompetitionSource)
+        .where(CompetitionSource.competition_id == competition.id)
+        .order_by(CompetitionSource.id)
+        .with_for_update()
+    ).all()
+
+    for source in sources:
+        if source.source_kind != "organizer":
+            raise SubmissionValidationError(
+                "selected competition has non-organizer source provenance"
+            )
+        if source.organizer_submission_id is None:
+            raise SubmissionValidationError(
+                "organizer source has no linked approved submission"
+            )
+
+        linked_submission = db.scalar(
+            select(OrganizerSubmission)
+            .where(OrganizerSubmission.id == source.organizer_submission_id)
+            .with_for_update()
+        )
+        if (
+            linked_submission is None
+            or linked_submission.status != "approved"
+            or linked_submission.approved_competition_id != competition.id
+        ):
+            raise SubmissionValidationError(
+                "organizer source does not match an approved submission"
+            )
+
+        consent = db.scalar(
+            select(SubmissionConsent)
+            .where(SubmissionConsent.submission_id == linked_submission.id)
+            .with_for_update()
+        )
+        _validate_consent_record(consent, linked_submission)
+
+        approval_event = db.scalar(
+            select(SubmissionReviewEvent.id)
+            .where(
+                SubmissionReviewEvent.submission_id == linked_submission.id,
+                SubmissionReviewEvent.previous_status == "under_review",
+                SubmissionReviewEvent.new_status == "approved",
+                SubmissionReviewEvent.reviewer_user_id.is_not(None),
+            )
+            .limit(1)
+        )
+        if approval_event is None:
+            raise SubmissionValidationError(
+                "organizer source has no recorded admin approval event"
+            )
+
+        if _normalize_provenance_url(source.source_url) != _normalize_provenance_url(
+            linked_submission.official_url
+        ):
+            raise SubmissionValidationError(
+                "organizer source URL does not match its submission"
+            )
 
 
 class SubmissionNotFoundError(LookupError):
@@ -421,22 +530,7 @@ def _validate_approval_snapshot(
         .where(SubmissionConsent.submission_id == submission.id)
         .with_for_update()
     )
-    if (
-        consent is None
-        or consent.submitter_user_id != submission.submitter_user_id
-        or consent.submission_id != submission.id
-        or not consent.declaration_version.strip()
-        or not consent.declaration_text
-        or consent.accepted_at is None
-        or consent.accepted_at.tzinfo is None
-        or sha256(consent.declaration_text.encode("utf-8")).hexdigest()
-        != consent.declaration_sha256
-    ):
-        raise SubmissionValidationError("submission consent record is missing or invalid")
-    try:
-        normalize_email(consent.submitter_email_snapshot)
-    except ValueError as exc:
-        raise SubmissionValidationError("submission consent email snapshot is invalid") from exc
+    _validate_consent_record(consent, submission)
 
     links = db.scalars(
         select(OrganizerSubmissionCategory)
@@ -583,7 +677,22 @@ def _record_approval_event(
     )
 
 
-def _publish_approved_competition(competition: Competition) -> None:
+def _publish_approved_competition(db: Session, competition: Competition) -> None:
+    # Narrow defense in depth: approval validates all prior sources before
+    # writing, and this final check prevents publication with an unlinked or
+    # non-organizer source. It is not a source-authorization policy decision.
+    sources = db.scalars(
+        select(CompetitionSource)
+        .where(CompetitionSource.competition_id == competition.id)
+        .order_by(CompetitionSource.id)
+    ).all()
+    if not sources or any(
+        source.source_kind != "organizer" or source.organizer_submission_id is None
+        for source in sources
+    ):
+        raise SubmissionValidationError(
+            "competition cannot be published with incomplete source provenance"
+        )
     competition.is_published = True
 
 
@@ -618,6 +727,7 @@ def approve_submission(
                 )
                 if competition is None:
                     raise SubmissionValidationError("selected competition does not exist")
+                _validate_existing_competition_sources(db, competition)
                 if not competition.is_published:
                     competition.is_published = False
 
@@ -691,7 +801,7 @@ def approve_submission(
                 previous_status=previous_status,
             )
             db.flush()
-            _publish_approved_competition(competition)
+            _publish_approved_competition(db, competition)
             db.flush()
 
         db.commit()

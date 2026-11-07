@@ -17,10 +17,12 @@ from app.models import (
     Competition,
     CompetitionCategory,
     CompetitionOrganizer,
+    CompetitionPrize,
     CompetitionSource,
     FieldEvidence,
     Organizer,
     OrganizerSubmission,
+    OrganizerSubmissionCategory,
     SubmissionConsent,
     SubmissionReviewEvent,
 )
@@ -29,8 +31,36 @@ from app.submissions.consent import (
     CURRENT_CONSENT_DECLARATION_TEXT,
     CURRENT_CONSENT_DECLARATION_VERSION,
 )
+from app.submissions.service import (
+    SubmissionValidationError,
+    _normalize_provenance_url,
+    _validate_existing_competition_sources,
+)
 
 pytestmark = pytest.mark.integration
+
+
+def _assert_approval_test_database(database_name: str | None) -> None:
+    if database_name != "fynd_test":
+        raise RuntimeError(
+            "submission approval integration tests require database name 'fynd_test'"
+        )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _guard_approval_test_database() -> None:
+    # engine.url is configuration metadata; inspecting it does not connect.
+    _assert_approval_test_database(engine.url.database)
+
+
+@pytest.mark.parametrize("database_name", [None, "", "fynd", "postgres", "fynd_test "])
+def test_approval_database_guard_rejects_unsafe_database_names(database_name):
+    with pytest.raises(RuntimeError, match="require database name 'fynd_test'"):
+        _assert_approval_test_database(database_name)
+
+
+def test_approval_database_guard_accepts_only_fynd_test():
+    assert _assert_approval_test_database("fynd_test") is None
 
 
 @pytest.fixture
@@ -141,11 +171,18 @@ def _admin_login(client: TestClient, db: Session, suffix: str = "admin") -> User
 def _counts(db: Session) -> dict[str, int]:
     return {
         "competitions": db.scalar(select(func.count()).select_from(Competition)),
+        "submissions": db.scalar(select(func.count()).select_from(OrganizerSubmission)),
+        "consents": db.scalar(select(func.count()).select_from(SubmissionConsent)),
+        "submission_categories": db.scalar(
+            select(func.count()).select_from(OrganizerSubmissionCategory)
+        ),
+        "categories": db.scalar(select(func.count()).select_from(Category)),
         "sources": db.scalar(select(func.count()).select_from(CompetitionSource)),
         "evidence": db.scalar(select(func.count()).select_from(FieldEvidence)),
         "organizers": db.scalar(select(func.count()).select_from(Organizer)),
         "competition_organizers": db.scalar(select(func.count()).select_from(CompetitionOrganizer)),
         "competition_categories": db.scalar(select(func.count()).select_from(CompetitionCategory)),
+        "prizes": db.scalar(select(func.count()).select_from(CompetitionPrize)),
         "review_events": db.scalar(select(func.count()).select_from(SubmissionReviewEvent)),
     }
 
@@ -264,6 +301,16 @@ def test_multiple_submissions_can_preserve_provenance_to_same_competition(approv
     db.commit()
     submission_ids = []
     for index in range(2):
+        if index == 1:
+            first_source = db.scalar(
+                select(CompetitionSource).where(
+                    CompetitionSource.competition_id == competition.id
+                )
+            )
+            first_source.source_url = (
+                "https://events.example.org/hackathon?utm_source=old"
+            )
+            db.commit()
         submission_id, _ = _make_under_review(
             client, db, email=f"shared-{index}-{uuid4().hex}@example.org"
         )
@@ -297,6 +344,175 @@ def test_multiple_submissions_can_preserve_provenance_to_same_competition(approv
         )
         == 1
     )
+
+
+def test_provenance_url_uses_existing_normalization_rules():
+    assert _normalize_provenance_url(
+        "https://EVENTS.example.org/hackathon?utm_source=old&campaign=shared"
+    ) == _normalize_provenance_url(
+        "https://events.example.org/hackathon?campaign=shared"
+    )
+    with pytest.raises(SubmissionValidationError):
+        _normalize_provenance_url("http://events.example.org/hackathon")
+
+
+def test_non_organizer_provenance_guard_is_exercised_without_database():
+    class Result:
+        def all(self):
+            return [
+                type(
+                    "Source",
+                    (),
+                    {
+                        "source_kind": "aggregator",
+                        "organizer_submission_id": None,
+                    },
+                )()
+            ]
+
+    class SessionStub:
+        def scalars(self, _statement):
+            return Result()
+
+        def scalar(self, _statement):
+            raise AssertionError("non-organizer sources must be rejected before lookup")
+
+    with pytest.raises(SubmissionValidationError, match="non-organizer"):
+        _validate_existing_competition_sources(
+            SessionStub(), type("Competition", (), {"id": 101})()
+        )
+
+
+def _create_approved_organizer_source(db, client):
+    competition = Competition(is_published=False)
+    organizer = Organizer(name="Previously approved organizer")
+    db.add_all([competition, organizer])
+    db.commit()
+    submission_id, _ = _make_under_review(client, db)
+    _admin_login(client, db, "provenance-first-admin")
+    response = client.post(
+        f"/api/v1/admin/submissions/{submission_id}/approve",
+        json={
+            "existing_competition_id": competition.id,
+            "existing_organizer_id": organizer.id,
+        },
+    )
+    assert response.status_code == 200, response.text
+    source = db.scalar(
+        select(CompetitionSource).where(
+            CompetitionSource.competition_id == competition.id
+        )
+    )
+    return competition, source
+
+
+@pytest.mark.parametrize(
+    "invalid_provenance",
+    [
+        "non_organizer_kind",
+        "missing_submission_link",
+        "mismatched_submission_link",
+        "missing_consent",
+        "invalid_consent_hash",
+        "mismatched_consent_submitter",
+        "missing_approval_event",
+        "source_url_mismatch",
+    ],
+)
+def test_existing_competition_reuse_rejects_invalid_provenance_atomically(
+    approval_db, client, invalid_provenance
+):
+    db = approval_db
+    competition, source = _create_approved_organizer_source(db, client)
+    target_submission_id, _ = _make_under_review(
+        client, db, email=f"provenance-target-{uuid4().hex}@example.org"
+    )
+    linked_submission = db.get(OrganizerSubmission, source.organizer_submission_id)
+
+    if invalid_provenance == "non_organizer_kind":
+        source.source_kind = "aggregator"
+    elif invalid_provenance == "missing_submission_link":
+        source.organizer_submission_id = None
+    elif invalid_provenance == "mismatched_submission_link":
+        source.organizer_submission_id = target_submission_id
+    elif invalid_provenance == "missing_consent":
+        consent = db.scalar(
+            select(SubmissionConsent).where(
+                SubmissionConsent.submission_id == linked_submission.id
+            )
+        )
+        db.delete(consent)
+    elif invalid_provenance == "invalid_consent_hash":
+        consent = db.scalar(
+            select(SubmissionConsent).where(
+                SubmissionConsent.submission_id == linked_submission.id
+            )
+        )
+        consent.declaration_sha256 = "0" * 64
+    elif invalid_provenance == "mismatched_consent_submitter":
+        consent = db.scalar(
+            select(SubmissionConsent).where(
+                SubmissionConsent.submission_id == linked_submission.id
+            )
+        )
+        consent.submitter_user_id = db.get(
+            OrganizerSubmission, target_submission_id
+        ).submitter_user_id
+    elif invalid_provenance == "missing_approval_event":
+        approval_event = db.scalar(
+            select(SubmissionReviewEvent).where(
+                SubmissionReviewEvent.submission_id == linked_submission.id,
+                SubmissionReviewEvent.new_status == "approved",
+            )
+        )
+        db.delete(approval_event)
+    elif invalid_provenance == "source_url_mismatch":
+        source.source_url = "https://events.example.org/a-different-event"
+    db.commit()
+
+    before_counts = _counts(db)
+    before_publication = competition.is_published
+    _admin_login(client, db, f"provenance-reject-{invalid_provenance}")
+    response = client.post(
+        f"/api/v1/admin/submissions/{target_submission_id}/approve",
+        json={"existing_competition_id": competition.id},
+    )
+
+    assert response.status_code == 422, response.text
+    assert db.get(OrganizerSubmission, target_submission_id).status == "under_review"
+    db.refresh(competition)
+    assert competition.is_published is before_publication
+    assert _counts(db) == before_counts
+
+
+def test_kaggle_style_source_cannot_be_republished_by_submission_approval(
+    approval_db, client
+):
+    db = approval_db
+    competition = Competition(is_published=False)
+    db.add(competition)
+    db.flush()
+    kaggle_source = CompetitionSource(
+        competition_id=competition.id,
+        source_kind="aggregator",
+        source_url="https://www.kaggle.com/competitions/example",
+    )
+    db.add(kaggle_source)
+    db.commit()
+    submission_id, _ = _make_under_review(client, db)
+    before_counts = _counts(db)
+
+    _admin_login(client, db, "kaggle-provenance-admin")
+    response = client.post(
+        f"/api/v1/admin/submissions/{submission_id}/approve",
+        json={"existing_competition_id": competition.id},
+    )
+
+    assert response.status_code == 422, response.text
+    assert db.get(OrganizerSubmission, submission_id).status == "under_review"
+    db.refresh(competition)
+    assert competition.is_published is False
+    assert _counts(db) == before_counts
 
 
 def test_approval_rejects_invalid_status_competition_and_organizer(approval_db, client):
@@ -406,7 +622,7 @@ def test_approval_failures_roll_back_competition_source_and_evidence(
         monkeypatch.setattr(
             service,
             "_publish_approved_competition",
-            lambda _competition: (_ for _ in ()).throw(
+            lambda _db, _competition: (_ for _ in ()).throw(
                 RuntimeError("simulated publication failure")
             ),
         )
