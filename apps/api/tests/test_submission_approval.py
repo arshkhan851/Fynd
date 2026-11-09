@@ -233,6 +233,10 @@ def test_approval_creates_evidence_relations_and_publishes_atomically(approval_d
     }
     assert all(item.field_name in REVIEW_SUPPORTED_EVIDENCE_FIELDS for item in evidence)
     assert all(item.review_state == "selected" for item in evidence)
+    assert all(
+        item.field_key == ("" if item.field_name != "category" else item.observed_value["slug"])
+        for item in evidence
+    )
     category_link = db.get(CompetitionCategory, (competition_id, categories[0].id))
     assert category_link is not None and category_link.is_primary is True
     organizer_link = db.scalar(

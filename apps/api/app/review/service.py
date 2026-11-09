@@ -109,6 +109,16 @@ _DATE_FIELD_COLUMNS = {
     "event_ends": ("event_ends_on", "event_ends_at"),
 }
 
+_SCALAR_EVIDENCE_FIELDS = frozenset(_SCALAR_FIELD_MAPPINGS) | frozenset(
+    _DATE_FIELD_COLUMNS
+)
+
+
+def _validate_scalar_field_key(field_name: str, field_key: str) -> None:
+    """Scalar evidence has one canonical key; category evidence uses its own path."""
+    if field_name in _SCALAR_EVIDENCE_FIELDS and field_key != "":
+        raise ReviewError(f"scalar evidence field '{field_name}' must have an empty field_key")
+
 
 def _scalar_mapping(field_name: str) -> tuple[str, Callable[[Any], Any]]:
     if field_name not in REVIEW_SUPPORTED_EVIDENCE_FIELDS or field_name == "category":
@@ -269,6 +279,8 @@ def accept_evidence(session: Session, evidence_id: int, *, commit: bool = True) 
             raise ReviewError(f"evidence {evidence_id} was not found")
         if evidence.review_state != "candidate":
             raise ReviewError(f"evidence {evidence_id} is already {evidence.review_state}")
+        if evidence.field_name != "category":
+            _validate_scalar_field_key(evidence.field_name, evidence.field_key)
         competition = session.scalar(
             select(Competition)
             .where(Competition.id == evidence.competition_id)

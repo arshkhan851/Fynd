@@ -208,6 +208,7 @@ def test_accepting_replacement_supersedes_prior_selection_and_keeps_both(db_sess
     db_session.refresh(old)
     db_session.refresh(replacement)
     assert competition.title == "Updated title"
+    assert old.field_key == replacement.field_key == ""
     assert old.review_state == "superseded"
     assert replacement.review_state == "selected"
     assert db_session.scalar(
@@ -216,6 +217,91 @@ def test_accepting_replacement_supersedes_prior_selection_and_keeps_both(db_sess
             FieldEvidence.field_name == "title",
         )
     ) == 2
+
+
+def test_scalar_evidence_rejects_non_empty_key_without_changing_value_or_selection(
+    db_session, monkeypatch
+):
+    competition = Competition(title="Selected title")
+    db_session.add(competition)
+    db_session.flush()
+    _, selected = _add_source_and_evidence(
+        db_session,
+        competition,
+        value={"title": "Selected title"},
+        review_state="selected",
+        suffix="scalar-key-selected",
+    )
+    candidate = FieldEvidence(
+        id=-1,
+        competition_id=competition.id,
+        source_id=selected.source_id,
+        field_name="title",
+        field_key="alternate-title",
+        observed_value={"title": "Conflicting title"},
+        evidence_excerpt="Conflicting title",
+        review_state="candidate",
+    )
+
+    # Simulate a malformed historical row returned by the evidence lookup. The
+    # current PostgreSQL CHECK correctly prevents inserting such a row now.
+    with monkeypatch.context() as patch:
+        patch.setattr(db_session, "scalar", lambda _statement: candidate)
+        with pytest.raises(ReviewError, match="must have an empty field_key"):
+            accept_evidence(db_session, candidate.id)
+
+    db_session.refresh(competition)
+    db_session.refresh(selected)
+    assert competition.title == "Selected title"
+    assert selected.review_state == "selected"
+    assert candidate.review_state == "candidate"
+    assert candidate.reviewed_at is None
+
+
+def test_database_check_rejects_new_scalar_evidence_with_non_empty_key(db_session):
+    competition = Competition(title="Constraint test")
+    db_session.add(competition)
+    db_session.flush()
+    source, _ = _add_source_and_evidence(
+        db_session,
+        competition,
+        value={"title": "Constraint test"},
+        suffix="scalar-key-constraint",
+    )
+    invalid = FieldEvidence(
+        competition_id=competition.id,
+        source_id=source.id,
+        field_name="title",
+        field_key="alternate-title",
+        observed_value={"title": "Should be rejected by PostgreSQL"},
+        review_state="candidate",
+    )
+
+    with pytest.raises(IntegrityError, match="ck_field_evidence_scalar_empty_key"):
+        with db_session.begin_nested():
+            db_session.add(invalid)
+            db_session.flush()
+
+
+def test_reaccepting_selected_scalar_evidence_remains_rejected(db_session):
+    competition = Competition(title="Before review")
+    db_session.add(competition)
+    db_session.flush()
+    _, evidence = _add_source_and_evidence(
+        db_session,
+        competition,
+        value={"title": "Reviewed title"},
+        suffix="scalar-reaccept",
+    )
+
+    accept_evidence(db_session, evidence.id)
+    with pytest.raises(ReviewError, match="already selected"):
+        accept_evidence(db_session, evidence.id)
+
+    db_session.refresh(competition)
+    db_session.refresh(evidence)
+    assert competition.title == "Reviewed title"
+    assert evidence.review_state == "selected"
 
 
 @pytest.mark.parametrize(

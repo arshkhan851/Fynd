@@ -650,6 +650,12 @@ class FieldEvidence(Base):
             "review_state IN ('candidate', 'selected', 'rejected', 'superseded')",
             name="ck_field_evidence_review_state",
         ),
+        CheckConstraint(
+            "field_name NOT IN ('title', 'description', 'eligibility_summary', 'format', "
+            "'registration_opens', 'registration_deadline', 'event_starts', 'event_ends', "
+            "'event_timezone', 'official_url', 'registration_url') OR field_key = ''",
+            name="ck_field_evidence_scalar_empty_key",
+        ),
         Index(
             "uq_selected_field_evidence",
             "competition_id",
