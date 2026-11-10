@@ -127,6 +127,35 @@ class Competition(Base):
         back_populates="approved_competition",
         foreign_keys="OrganizerSubmission.approved_competition_id",
     )
+    saved_by_users: Mapped[list[SavedCompetition]] = relationship(
+        back_populates="competition",
+        cascade="all, delete-orphan",
+        foreign_keys="SavedCompetition.competition_id",
+    )
+
+
+class SavedCompetition(Base):
+    __tablename__ = "saved_competitions"
+    __table_args__ = (
+        Index("ix_saved_competitions_user_created_at", "user_id", "created_at"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    competition_id: Mapped[int] = mapped_column(
+        ForeignKey("competitions.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    user: Mapped[User] = relationship(
+        back_populates="saved_competitions", foreign_keys=[user_id]
+    )
+    competition: Mapped[Competition] = relationship(
+        back_populates="saved_by_users", foreign_keys=[competition_id]
+    )
 
 
 class Organizer(Base):

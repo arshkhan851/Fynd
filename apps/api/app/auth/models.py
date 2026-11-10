@@ -1,10 +1,14 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+if TYPE_CHECKING:
+    from app.models import SavedCompetition
 
 
 class User(Base):
@@ -25,6 +29,11 @@ class User(Base):
     )
     auth_tokens: Mapped[list["EmailAuthToken"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
+    )
+    saved_competitions: Mapped[list["SavedCompetition"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="SavedCompetition.user_id",
     )
 
 

@@ -18,12 +18,14 @@ from app.models import (
     CompetitionOrganizer,
     CompetitionSource,
 )
+from app.saved_opportunities.router import router as saved_opportunities_router
 from app.submissions.admin_router import router as admin_submissions_router
 from app.submissions.router import router as submissions_router
 
 app = FastAPI(title=os.getenv("APP_NAME", "api"))
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(submissions_router, prefix="/api/v1")
+app.include_router(saved_opportunities_router, prefix="/api/v1")
 app.include_router(admin_submissions_router, prefix="/api/v1")
 
 _default_origins = "http://localhost:3000,http://127.0.0.1:3000"
@@ -36,7 +38,7 @@ _origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type"],
     allow_credentials=True,
 )
