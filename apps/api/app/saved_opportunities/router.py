@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
@@ -24,6 +25,17 @@ def _visible_competition_filters():
     return (Competition.is_published.is_(True), Competition.title.is_not(None))
 
 
+def _raise_database_unavailable(db: Session) -> None:
+    try:
+        db.rollback()
+    except SQLAlchemyError:
+        pass
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"status": "unavailable"},
+    ) from None
+
+
 @router.get("", response_model=SavedOpportunityListResponse)
 def list_saved_opportunities(
     db: Annotated[Session, Depends(get_db)],
@@ -35,23 +47,26 @@ def list_saved_opportunities(
         SavedCompetition.user_id == current_user.id,
         *_visible_competition_filters(),
     )
-    total = (
-        db.scalar(
-            select(func.count())
-            .select_from(SavedCompetition)
+    try:
+        total = (
+            db.scalar(
+                select(func.count())
+                .select_from(SavedCompetition)
+                .join(Competition, Competition.id == SavedCompetition.competition_id)
+                .where(*filters)
+            )
+            or 0
+        )
+        rows = db.execute(
+            select(SavedCompetition, Competition)
             .join(Competition, Competition.id == SavedCompetition.competition_id)
             .where(*filters)
-        )
-        or 0
-    )
-    rows = db.execute(
-        select(SavedCompetition, Competition)
-        .join(Competition, Competition.id == SavedCompetition.competition_id)
-        .where(*filters)
-        .order_by(SavedCompetition.created_at.desc(), Competition.id.desc())
-        .limit(limit)
-        .offset(offset)
-    ).all()
+            .order_by(SavedCompetition.created_at.desc(), Competition.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+    except SQLAlchemyError:
+        _raise_database_unavailable(db)
     return SavedOpportunityListResponse(
         items=[
             SavedOpportunityItem(
@@ -82,27 +97,28 @@ def save_opportunity(
     db: Annotated[Session, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> SavedOpportunityMutationResponse:
-    competition = db.scalar(
-        select(Competition)
-        .where(Competition.id == competition_id, *_visible_competition_filters())
-        .with_for_update(read=True)
-    )
-    if competition is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Competition not found")
-
-    statement = (
-        insert(SavedCompetition)
-        .values(user_id=current_user.id, competition_id=competition_id)
-        .on_conflict_do_nothing(
-            index_elements=[SavedCompetition.user_id, SavedCompetition.competition_id]
-        )
-    )
     try:
+        competition = db.scalar(
+            select(Competition)
+            .where(Competition.id == competition_id, *_visible_competition_filters())
+            .with_for_update(read=True)
+        )
+        if competition is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Competition not found"
+            )
+
+        statement = (
+            insert(SavedCompetition)
+            .values(user_id=current_user.id, competition_id=competition_id)
+            .on_conflict_do_nothing(
+                index_elements=[SavedCompetition.user_id, SavedCompetition.competition_id]
+            )
+        )
         db.execute(statement)
         db.commit()
-    except Exception:
-        db.rollback()
-        raise
+    except SQLAlchemyError:
+        _raise_database_unavailable(db)
     return SavedOpportunityMutationResponse(competition_id=competition_id, saved=True)
 
 
@@ -114,11 +130,14 @@ def remove_saved_opportunity(
     db: Annotated[Session, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> SavedOpportunityMutationResponse:
-    db.execute(
-        SavedCompetition.__table__.delete().where(
-            SavedCompetition.user_id == current_user.id,
-            SavedCompetition.competition_id == competition_id,
+    try:
+        db.execute(
+            SavedCompetition.__table__.delete().where(
+                SavedCompetition.user_id == current_user.id,
+                SavedCompetition.competition_id == competition_id,
+            )
         )
-    )
-    db.commit()
+        db.commit()
+    except SQLAlchemyError:
+        _raise_database_unavailable(db)
     return SavedOpportunityMutationResponse(competition_id=competition_id, saved=False)

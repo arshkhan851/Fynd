@@ -20,7 +20,7 @@ from app.models import Competition, SavedCompetition
 pytestmark = pytest.mark.integration
 
 
-_EXPECTED_DATABASE_TARGET = ("127.0.0.1", 55432, "fynd_test", "fynd_test_user")
+_EXPECTED_DATABASE_TARGET = ("127.0.0.1", 56000, "fynd_test", "fynd_test_user")
 
 
 def _assert_saved_opportunities_test_database(
@@ -29,14 +29,14 @@ def _assert_saved_opportunities_test_database(
     if not database_url:
         raise RuntimeError(
             "Saved Opportunities API tests require DATABASE_URL targeting "
-            "127.0.0.1:55432/fynd_test as fynd_test_user"
+            "127.0.0.1:56000/fynd_test as fynd_test_user"
         )
     try:
         configured_url = make_url(database_url)
     except (ArgumentError, TypeError, ValueError):
         raise RuntimeError(
             "Saved Opportunities API tests require a valid DATABASE_URL targeting "
-            "127.0.0.1:55432/fynd_test as fynd_test_user"
+            "127.0.0.1:56000/fynd_test as fynd_test_user"
         ) from None
 
     configured_target = (
@@ -58,7 +58,7 @@ def _assert_saved_opportunities_test_database(
     ):
         raise RuntimeError(
             "Saved Opportunities API tests refuse database target; expected "
-            "host=127.0.0.1 port=55432 database=fynd_test user=fynd_test_user"
+            "host=127.0.0.1 port=56000 database=fynd_test user=fynd_test_user"
         )
 
 
@@ -71,10 +71,10 @@ _assert_saved_opportunities_test_database(os.environ.get("DATABASE_URL"), engine
         None,
         "",
         "not-a-database-url",
-        "postgresql://fynd_test_user:unused@localhost:55432/fynd_test",
+        "postgresql://fynd_test_user:unused@localhost:56000/fynd_test",
         "postgresql://fynd_test_user:unused@127.0.0.1:5432/fynd_test",
-        "postgresql://fynd_test_user:unused@127.0.0.1:55432/fynd",
-        "postgresql://fynd:unused@127.0.0.1:55432/fynd_test",
+        "postgresql://fynd_test_user:unused@127.0.0.1:56000/fynd",
+        "postgresql://fynd:unused@127.0.0.1:56000/fynd_test",
     ],
 )
 def test_saved_opportunities_database_guard_rejects_unsafe_targets(database_url):
@@ -84,12 +84,12 @@ def test_saved_opportunities_database_guard_rejects_unsafe_targets(database_url)
 
 def test_saved_opportunities_database_guard_accepts_isolated_target():
     _assert_saved_opportunities_test_database(
-        "postgresql://fynd_test_user:unused@127.0.0.1:55432/fynd_test"
+        "postgresql://fynd_test_user:unused@127.0.0.1:56000/fynd_test"
     )
 
 
 def test_saved_opportunities_database_guard_checks_engine_target():
-    configured_target = "postgresql://fynd_test_user:unused@127.0.0.1:55432/fynd_test"
+    configured_target = "postgresql://fynd_test_user:unused@127.0.0.1:56000/fynd_test"
     wrong_engine_target = make_url(
         "postgresql://fynd_test_user:unused@127.0.0.1:5432/fynd_test"
     )
@@ -179,6 +179,49 @@ def test_saved_opportunities_are_private_and_delete_is_owner_scoped(
     }
     assert _saved_count(db, owner.id) == 1
     assert _saved_count(db, other.id) == 0
+
+
+def test_users_can_save_same_competition_without_exposing_each_others_data(
+    saved_opportunities_db, client
+):
+    db = saved_opportunities_db
+    user_a_client = TestClient(app)
+    user_a = _login(user_a_client, db, email=f"saved-cross-a-{uuid4().hex}@example.org")
+    user_b = _login(client, db, email=f"saved-cross-b-{uuid4().hex}@example.org")
+    competition = _public_competition(db)
+    path = f"/api/v1/saved-opportunities/{competition.id}"
+
+    assert user_a_client.put(path).status_code == 200
+    assert client.put(path).status_code == 200
+
+    user_b_response = client.get("/api/v1/saved-opportunities").json()
+    user_a_response = user_a_client.get("/api/v1/saved-opportunities").json()
+
+    assert user_b_response["total"] == 1
+    assert [item["competition_id"] for item in user_b_response["items"]] == [
+        competition.id
+    ]
+    assert user_a_response["total"] == 1
+    assert [item["competition_id"] for item in user_a_response["items"]] == [
+        competition.id
+    ]
+    expected_item_fields = {
+        "competition_id",
+        "title",
+        "format",
+        "event_starts_on",
+        "event_starts_at",
+        "registration_deadline_on",
+        "registration_deadline_at",
+        "saved_at",
+    }
+    for item in (*user_a_response["items"], *user_b_response["items"]):
+        assert set(item) == expected_item_fields
+        assert "user_id" not in item
+        assert "email" not in item
+
+    assert _saved_count(db, user_a.id) == 1
+    assert _saved_count(db, user_b.id) == 1
 
 
 def test_save_is_idempotent_and_removal_is_idempotent(saved_opportunities_db, client):
