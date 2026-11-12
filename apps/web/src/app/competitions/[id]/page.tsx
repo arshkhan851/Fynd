@@ -4,6 +4,7 @@ import { connection } from "next/server";
 import { cache } from "react";
 
 import { SiteHeader } from "@/components/site-header";
+import { SaveOpportunityButton } from "@/components/save-opportunity-button";
 import { APP_NAME } from "@/lib/config";
 import { getCompetition } from "@/lib/competitions";
 
@@ -98,6 +99,10 @@ export default async function CompetitionDetailPage({
               ))}
             </ul>
           )}
+          <SaveOpportunityButton
+            competitionId={competition.id}
+            apiBaseUrl={process.env.API_BASE_URL ?? ""}
+          />
         </section>
 
         <ul aria-label="Competition metadata" className="metadata-strip">

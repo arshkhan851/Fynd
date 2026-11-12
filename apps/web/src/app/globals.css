@@ -251,6 +251,18 @@ button:focus-visible {
   font-size: 12px;
 }
 
+.save-opportunity-button:disabled {
+  cursor: progress;
+  opacity: .65;
+}
+
+.save-opportunity-note {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .filter-clear {
   align-self: center;
   color: var(--muted);
@@ -606,6 +618,12 @@ button:focus-visible {
 .submission-list li { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 22px 8px; border-bottom: 1px solid var(--line); }
 .submission-list h2 { margin: 0; font: 400 23px Georgia, "Times New Roman", serif; }
 .submission-list p { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
+.saved-opportunities-count { margin: 24px 0 0; color: var(--muted); font-size: 12px; }
+.saved-opportunity-row { align-items: center; }
+.saved-opportunity-row h2 a { color: var(--ink); text-decoration: none; }
+.saved-opportunity-row h2 a:hover { text-decoration: underline; text-underline-offset: 4px; }
+.saved-opportunity-remove { flex: 0 0 auto; padding: 8px 0; }
+.saved-opportunity-remove:disabled { cursor: progress; opacity: .65; }
 .status-pill { padding: 6px 9px; border: 1px solid var(--line); border-radius: 999px; color: #56574e; font-size: 10px; text-transform: capitalize; }
 .status-pill--pending, .status-pill--under_review { background: #f3efcc; }
 .status-pill--approved { background: #e4edbc; }

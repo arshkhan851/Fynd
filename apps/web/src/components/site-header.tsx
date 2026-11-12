@@ -10,6 +10,7 @@ export function SiteHeader() {
         </Link>
         <nav aria-label="Main navigation" className="site-nav">
           <Link href="/#competitions">Competitions</Link>
+          <Link href="/saved-opportunities">Saved Opportunities</Link>
           <Link href="/submit">Submit an event</Link>
         </nav>
       </div>

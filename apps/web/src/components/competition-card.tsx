@@ -1,14 +1,17 @@
 import Link from "next/link";
 
 import type { Competition } from "@/lib/competitions";
+import { SaveOpportunityButton } from "@/components/save-opportunity-button";
 
 type CompetitionCardProps = {
   competition: Competition;
+  apiBaseUrl: string;
   featured?: boolean;
 };
 
 export function CompetitionCard({
   competition,
+  apiBaseUrl,
   featured = false,
 }: CompetitionCardProps) {
   const starts = competition.event_starts_on ?? competition.event_starts_at;
@@ -29,6 +32,10 @@ export function CompetitionCard({
         </div>
       </div>
       <div className="competition-card__actions">
+        <SaveOpportunityButton
+          competitionId={competition.id}
+          apiBaseUrl={apiBaseUrl}
+        />
         {competition.official_url && (
           <a href={competition.official_url} target="_blank" rel="noreferrer">
             Official site <span aria-hidden="true">↗</span>

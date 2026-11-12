@@ -158,9 +158,13 @@ export default async function Home({ searchParams }: HomeProps) {
           ) : (
             <>
               <div className="competition-list">
-                {offset === 0 && <CompetitionCard competition={competitions[0]} featured />}
+                {offset === 0 && <CompetitionCard competition={competitions[0]} apiBaseUrl={process.env.API_BASE_URL ?? ""} featured />}
                 {competitions.slice(offset === 0 ? 1 : 0).map((competition) => (
-                  <CompetitionCard competition={competition} key={competition.id} />
+                  <CompetitionCard
+                    apiBaseUrl={process.env.API_BASE_URL ?? ""}
+                    competition={competition}
+                    key={competition.id}
+                  />
                 ))}
               </div>
               {(offset > 0 || nextOffset < page!.total) && (
