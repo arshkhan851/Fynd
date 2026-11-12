@@ -8,8 +8,11 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+import app.models  # noqa: F401 - register SavedCompetition relationship mapping
 from app.auth.models import EmailAuthToken, User, UserSession
 from app.auth.service import (
+    MAX_ACTIVE_MAGIC_LINK_TOKENS,
+    ActiveMagicLinkLimitExceeded,
     generate_magic_link_token,
     revoke_session,
     verify_magic_token_and_create_session,
@@ -73,21 +76,59 @@ def test_expired_magic_link_is_rejected_without_session(db_factory):
         assert db.scalar(select(EmailAuthToken)).used_at is None
 
 
-def test_new_magic_link_invalidates_older_active_token(db_factory):
+def test_multiple_magic_links_are_independently_valid_and_single_use(db_factory):
     with db_factory() as db:
         _create_user(db)
-        old_token = generate_magic_link_token(db, "organizer@example.org")
-        new_token = generate_magic_link_token(db, "organizer@example.org")
+        tokens = [
+            generate_magic_link_token(db, "organizer@example.org")
+            for _ in range(2)
+        ]
 
-        old_record = db.scalar(
-            select(EmailAuthToken).where(EmailAuthToken.used_at.is_not(None))
-        )
-        assert old_record is not None
-        assert old_record.used_at is not None
-        assert verify_magic_token_and_create_session(db, old_token) is None
-        assert db.scalar(select(func.count()).select_from(UserSession)) == 0
-        assert verify_magic_token_and_create_session(db, new_token)
-        assert db.scalar(select(func.count()).select_from(UserSession)) == 1
+        assert all(verify_magic_token_and_create_session(db, token) for token in tokens)
+        assert all(verify_magic_token_and_create_session(db, token) is None for token in tokens)
+        assert db.scalar(select(func.count()).select_from(UserSession)) == 2
+        assert db.scalar(select(func.count()).select_from(EmailAuthToken)) == 2
+
+
+def test_expired_tokens_do_not_count_toward_active_token_cap(db_factory):
+    with db_factory() as db:
+        user = _create_user(db)
+        now = datetime.now(UTC)
+        for index in range(MAX_ACTIVE_MAGIC_LINK_TOKENS):
+            db.add(
+                EmailAuthToken(
+                    user_id=user.id,
+                    token_hash=hashlib.sha256(f"expired-{index}".encode()).hexdigest(),
+                    expires_at=now - timedelta(seconds=1),
+                )
+            )
+        db.commit()
+
+        assert generate_magic_link_token(db, user.email)
+        assert db.scalar(
+            select(func.count())
+            .select_from(EmailAuthToken)
+            .where(EmailAuthToken.expires_at > datetime.now(UTC))
+        ) == 1
+
+
+def test_active_token_cap_rejects_without_modifying_existing_tokens(db_factory):
+    with db_factory() as db:
+        _create_user(db)
+        tokens = [
+            generate_magic_link_token(db, "organizer@example.org")
+            for _ in range(MAX_ACTIVE_MAGIC_LINK_TOKENS)
+        ]
+        before = db.scalars(select(EmailAuthToken).order_by(EmailAuthToken.created_at)).all()
+        snapshots = [(row.token_hash, row.expires_at, row.used_at) for row in before]
+
+        with pytest.raises(ActiveMagicLinkLimitExceeded):
+            generate_magic_link_token(db, "organizer@example.org")
+
+        db.expire_all()
+        after = db.scalars(select(EmailAuthToken).order_by(EmailAuthToken.created_at)).all()
+        assert [(row.token_hash, row.expires_at, row.used_at) for row in after] == snapshots
+        assert all(verify_magic_token_and_create_session(db, token) for token in tokens)
 
 
 def test_session_creation_failure_rolls_back_token_consumption(db_factory, monkeypatch):

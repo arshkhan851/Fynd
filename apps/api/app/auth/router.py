@@ -6,10 +6,11 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
-from app.auth.email import BaseEmailProvider, get_email_provider
+from app.auth.email import BaseEmailProvider, EmailDeliveryError, get_email_provider
 from app.auth.email_address import normalize_email
 from app.auth.models import User
 from app.auth.service import (
+    ActiveMagicLinkLimitExceeded,
     generate_magic_link_token,
     revoke_session,
     verify_magic_token_and_create_session,
@@ -75,8 +76,19 @@ def request_magic_link(
     email_provider: BaseEmailProvider = Depends(get_email_provider),  # noqa: B008
 ):
     """Generates a magic link token and dispatches it via the email provider."""
-    raw_token = generate_magic_link_token(db, payload.email)
-    email_provider.send_magic_link(payload.email, raw_token)
+    try:
+        raw_token = generate_magic_link_token(db, payload.email)
+    except ActiveMagicLinkLimitExceeded:
+        # Keep the response indistinguishable from successful issuance so callers
+        # cannot learn whether this address has reached its active-token cap.
+        return {"message": "If the email is valid, a login link has been sent."}
+    try:
+        email_provider.send_magic_link(payload.email, raw_token)
+    except EmailDeliveryError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication email service is temporarily unavailable.",
+        ) from None
     
     # Always return a generic success message to prevent email enumeration
     return {"message": "If the email is valid, a login link has been sent."}

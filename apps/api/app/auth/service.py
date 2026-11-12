@@ -3,6 +3,8 @@ import secrets
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.auth.email_address import normalize_email
@@ -10,6 +12,11 @@ from app.auth.models import EmailAuthToken, User, UserSession
 
 TOKEN_LIFETIME_MINUTES = 15
 SESSION_LIFETIME_DAYS = 30
+MAX_ACTIVE_MAGIC_LINK_TOKENS = 5
+
+
+class ActiveMagicLinkLimitExceeded(RuntimeError):
+    """The user already has the maximum number of unexpired, unused links."""
 
 
 def _hash_token(token: str) -> str:
@@ -18,49 +25,68 @@ def _hash_token(token: str) -> str:
 
 
 def generate_magic_link_token(db: Session, email: str) -> str:
-    """
-    Finds or creates a user by email, invalidates any existing active magic links,
-    and returns a raw cryptographic token to be sent via email.
-    """
+    """Create an independently valid token, up to five active links per user."""
     normalized_email = normalize_email(email)
-    # Match legacy mixed-case rows without changing their stored addresses.
-    user = db.scalar(
-        select(User).where(func.lower(User.email) == normalized_email).with_for_update()
+    user_query = (
+        select(User)
+        .where(func.lower(User.email) == normalized_email)
+        .order_by(User.id)
+        .limit(2)
+        .with_for_update()
     )
-    if not user:
-        user = User(email=normalized_email)
-        db.add(user)
-        db.flush()  # Flush to get the new user.id
+    matching_users = db.scalars(user_query).all()
+    if len(matching_users) > 1:
+        db.rollback()
+        raise RuntimeError("Multiple users match the normalized email address")
+    user = matching_users[0] if matching_users else None
 
-    # 2. Invalidate existing outstanding tokens to prevent race conditions or abuse
+    if user is None:
+        dialect = db.get_bind().dialect.name
+        if dialect == "postgresql":
+            insert_user = pg_insert(User)
+        elif dialect == "sqlite":
+            insert_user = sqlite_insert(User)
+        else:
+            raise RuntimeError("Magic-link user creation requires PostgreSQL or SQLite")
+        db.execute(
+            insert_user.values(email=normalized_email).on_conflict_do_nothing(
+                index_elements=[User.email]
+            )
+        )
+        # The unique email constraint arbitrates concurrent first inserts. Lock the
+        # resulting row before counting or inserting tokens.
+        matching_users = db.scalars(user_query).all()
+        if len(matching_users) > 1:
+            db.rollback()
+            raise RuntimeError("Multiple users match the normalized email address")
+        if not matching_users:
+            db.rollback()
+            raise RuntimeError("Could not create or lock the authentication user")
+        user = matching_users[0]
+
     now = datetime.now(UTC)
-    db.execute(
-        update(EmailAuthToken)
+    active_count = db.scalar(
+        select(func.count())
+        .select_from(EmailAuthToken)
         .where(
             EmailAuthToken.user_id == user.id,
             EmailAuthToken.used_at.is_(None),
             EmailAuthToken.expires_at > now,
         )
-        .values(expires_at=now, used_at=now)
-        .execution_options(synchronize_session=False)
-    )
+    ) or 0
+    if active_count >= MAX_ACTIVE_MAGIC_LINK_TOKENS:
+        db.rollback()
+        raise ActiveMagicLinkLimitExceeded
 
-    # 3. Generate a new cryptographically secure token
     raw_token = secrets.token_urlsafe(32)
-    token_hash = _hash_token(raw_token)
-
-    expires_at = now + timedelta(minutes=TOKEN_LIFETIME_MINUTES)
-
     auth_token = EmailAuthToken(
         user_id=user.id,
-        token_hash=token_hash,
-        expires_at=expires_at,
+        token_hash=_hash_token(raw_token),
+        expires_at=now + timedelta(minutes=TOKEN_LIFETIME_MINUTES),
     )
     db.add(auth_token)
     db.commit()
-
     return raw_token
-
 
 def verify_magic_token_and_create_session(db: Session, raw_token: str) -> str | None:
     """
