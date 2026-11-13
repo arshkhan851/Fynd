@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import uuid
 
 import httpx
@@ -20,8 +21,16 @@ from app.auth.email import (
 )
 from app.auth.email_address import normalize_email
 from app.auth.models import EmailAuthToken, User, UserSession
-from app.auth.router import router
+from app.auth.rate_limit import (
+    RateLimitConfigurationError,
+    RateLimitDecision,
+    RateLimitStorageError,
+)
+from app.auth.rate_limit import increment_request_counters as real_increment_request_counters
+from app.auth.router import get_email_provider_factory, router
 from app.database import get_db
+
+auth_router_module = importlib.import_module("app.auth.router")
 
 
 class CapturingEmailProvider(BaseEmailProvider):
@@ -33,7 +42,7 @@ class CapturingEmailProvider(BaseEmailProvider):
 
 
 @pytest.fixture
-def auth_client():
+def auth_client(monkeypatch):
     engine = create_engine(
         "sqlite+pysqlite://",
         connect_args={"check_same_thread": False},
@@ -45,6 +54,7 @@ def auth_client():
     factory = sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
     provider = CapturingEmailProvider()
     app = FastAPI()
+    app.state.rate_limit_calls = []
     app.include_router(router, prefix="/api/v1")
 
     def override_db():
@@ -52,9 +62,19 @@ def auth_client():
             yield db
 
     app.dependency_overrides[get_db] = override_db
-    app.dependency_overrides[get_email_provider] = lambda: provider
+    app.dependency_overrides[get_email_provider_factory] = lambda: lambda: provider
+
+    def allow_rate_limited_request(db, *, email, client_ip):
+        app.state.rate_limit_calls.append((email, client_ip))
+        return RateLimitDecision(email_count=1, ip_count=1)
+
+    monkeypatch.setattr(
+        auth_router_module,
+        "increment_request_counters",
+        allow_rate_limited_request,
+    )
     try:
-        yield TestClient(app), factory, provider
+        yield TestClient(app, client=("198.51.100.10", 50000)), factory, provider
     finally:
         engine.dispose()
 
@@ -101,6 +121,154 @@ def test_request_link_normalizes_address_and_keeps_generic_response(auth_client)
     with factory() as db:
         user = db.scalar(select(User))
         assert user.email == "alice@example.org"
+
+
+def test_request_link_uses_peer_ip_and_counts_allowed_request(auth_client):
+    client, _, provider = auth_client
+
+    response = client.post(
+        "/api/v1/auth/request-link",
+        json={"email": "  Alice@EXAMPLE.ORG "},
+        headers={"X-Forwarded-For": "203.0.113.77"},
+    )
+
+    assert response.status_code == 202
+    assert client.app.state.rate_limit_calls == [
+        ("alice@example.org", "198.51.100.10")
+    ]
+    assert len(provider.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [RateLimitDecision(email_count=6, ip_count=1), RateLimitDecision(email_count=1, ip_count=11)],
+)
+def test_rate_limited_request_is_generic_and_does_not_generate_or_send(
+    auth_client, monkeypatch, decision
+):
+    client, _, _ = auth_client
+    provider_calls = []
+    client.app.dependency_overrides[get_email_provider_factory] = (
+        lambda: lambda: provider_calls.append("resolved")
+    )
+    monkeypatch.setattr(
+        auth_router_module,
+        "increment_request_counters",
+        lambda db, **kwargs: decision,
+    )
+    monkeypatch.setattr(
+        auth_router_module,
+        "generate_magic_link_token",
+        lambda *args: pytest.fail("rate-limited request generated a token"),
+    )
+
+    response = client.post(
+        "/api/v1/auth/request-link", json={"email": "user@example.org"}
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "message": "If the email is valid, a login link has been sent."
+    }
+    assert provider_calls == []
+
+
+def test_missing_or_malformed_peer_ip_fails_closed_without_sending(auth_client, monkeypatch):
+    client, _, _ = auth_client
+    invalid_peer = TestClient(client.app, client=("not-an-ip", 50000))
+    monkeypatch.setattr(
+        auth_router_module,
+        "generate_magic_link_token",
+        lambda *args: pytest.fail("invalid peer IP generated a token"),
+    )
+
+    response = invalid_peer.post(
+        "/api/v1/auth/request-link", json={"email": "user@example.org"}
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Authentication service is temporarily unavailable."
+    }
+    assert client.app.state.rate_limit_calls == []
+
+    class MissingPeerAddress:
+        async def __call__(self, scope, receive, send):
+            request_scope = {**scope, "client": None}
+            await client.app(request_scope, receive, send)
+
+    no_peer = TestClient(MissingPeerAddress(), client=("198.51.100.10", 50000))
+    missing_response = no_peer.post(
+        "/api/v1/auth/request-link", json={"email": "user@example.org"}
+    )
+    assert missing_response.status_code == 503
+    assert missing_response.json() == response.json()
+    assert client.app.state.rate_limit_calls == []
+
+
+@pytest.mark.parametrize(
+    "failure", [RateLimitConfigurationError, RateLimitStorageError]
+)
+def test_rate_limit_failure_returns_generic_503_without_token_or_email(
+    auth_client, monkeypatch, failure
+):
+    client, _, _ = auth_client
+    provider_calls = []
+    client.app.dependency_overrides[get_email_provider_factory] = (
+        lambda: lambda: provider_calls.append("resolved")
+    )
+
+    def fail_closed(*args, **kwargs):
+        raise failure("sensitive internal failure detail")
+
+    monkeypatch.setattr(auth_router_module, "increment_request_counters", fail_closed)
+    monkeypatch.setattr(
+        auth_router_module,
+        "generate_magic_link_token",
+        lambda *args: pytest.fail("rate-limit failure generated a token"),
+    )
+
+    response = client.post(
+        "/api/v1/auth/request-link", json={"email": "user@example.org"}
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Authentication service is temporarily unavailable."
+    }
+    assert "sensitive internal failure detail" not in response.text
+    assert provider_calls == []
+
+
+@pytest.mark.parametrize("invalid_config", ["missing", "malformed"])
+def test_missing_or_invalid_hmac_configuration_returns_generic_503(
+    auth_client, monkeypatch, invalid_config
+):
+    client, _, _ = auth_client
+    provider_calls = []
+    client.app.dependency_overrides[get_email_provider_factory] = (
+        lambda: lambda: provider_calls.append("resolved")
+    )
+    monkeypatch.setattr(
+        auth_router_module,
+        "increment_request_counters",
+        real_increment_request_counters,
+    )
+    monkeypatch.delenv("AUTH_RATE_LIMIT_HMAC_KEY_ID", raising=False)
+    monkeypatch.delenv("AUTH_RATE_LIMIT_HMAC_KEY_B64", raising=False)
+    if invalid_config == "malformed":
+        monkeypatch.setenv("AUTH_RATE_LIMIT_HMAC_KEY_ID", "invalid_key")
+        monkeypatch.setenv("AUTH_RATE_LIMIT_HMAC_KEY_B64", "not-base64")
+
+    response = client.post(
+        "/api/v1/auth/request-link", json={"email": "user@example.org"}
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Authentication service is temporarily unavailable."
+    }
+    assert provider_calls == []
 
 
 def test_differently_cased_registration_reuses_one_user(auth_client):
@@ -294,15 +462,15 @@ def test_automated_tests_must_inject_fake_provider(monkeypatch):
 
 
 def test_provider_rejection_returns_safe_unavailable_response(auth_client):
-    from app.auth.router import get_email_provider as dependency
-
     client, _, _ = auth_client
 
     class RejectingProvider(BaseEmailProvider):
         def send_magic_link(self, email: str, raw_token: str) -> None:
             raise EmailDeliveryError("sanitized provider failure")
 
-    client.app.dependency_overrides[dependency] = RejectingProvider
+    client.app.dependency_overrides[get_email_provider_factory] = (
+        lambda: lambda: RejectingProvider()
+    )
     response = client.post("/api/v1/auth/request-link", json={"email": "user@example.org"})
 
     assert response.status_code == 503
@@ -313,8 +481,6 @@ def test_provider_rejection_returns_safe_unavailable_response(auth_client):
 
 
 def test_failed_email_delivery_does_not_invalidate_earlier_link(auth_client):
-    from app.auth.router import get_email_provider as dependency
-
     client, factory, provider = auth_client
     first = client.post(
         "/api/v1/auth/request-link", json={"email": "user@example.org"}
@@ -332,12 +498,15 @@ def test_failed_email_delivery_does_not_invalidate_earlier_link(auth_client):
             raise EmailDeliveryError("sanitized provider failure")
 
     rejecting_provider = RejectingProvider()
-    client.app.dependency_overrides[dependency] = lambda: rejecting_provider
+    client.app.dependency_overrides[get_email_provider_factory] = (
+        lambda: lambda: rejecting_provider
+    )
     failed = client.post(
         "/api/v1/auth/request-link", json={"email": "user@example.org"}
     )
 
     assert failed.status_code == 503
+    assert len(client.app.state.rate_limit_calls) == 2
     failed_hash = hashlib.sha256(rejecting_provider.raw_token.encode()).hexdigest()
     with factory() as db:
         active_rows = db.scalars(
@@ -351,7 +520,9 @@ def test_failed_email_delivery_does_not_invalidate_earlier_link(auth_client):
 
     # The failed delivery's token may remain active, but earlier delivered links
     # remain untouched and usable until their normal expiry or consumption.
-    client.app.dependency_overrides[dependency] = lambda: provider
+    client.app.dependency_overrides[get_email_provider_factory] = (
+        lambda: lambda: provider
+    )
     for _ in range(3):
         successful = client.post(
             "/api/v1/auth/request-link", json={"email": "user@example.org"}
