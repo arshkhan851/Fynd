@@ -11,7 +11,7 @@ from uuid import uuid4
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import DateTime, delete, func, inspect, literal, select, text, tuple_
+from sqlalchemy import DateTime, delete, func, insert, inspect, literal, select, text, tuple_
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, sessionmaker
@@ -582,56 +582,214 @@ def test_failed_delivery_attempts_consume_both_rate_limits(rate_limit_case, monk
         _cleanup_integrated_request_data([email], client_ip, keyring)
 
 
-def test_cleanup_deletes_only_one_bounded_batch_of_expired_rows():
-    key_id = f"cleanup{uuid4().hex[:8]}"
-    now = datetime.now(UTC)
-    stale_window = fixed_window_start(now - timedelta(days=2))
-    current_window = fixed_window_start(now)
-    stale_rows = [
+def _cleanup_test_rows(db: Session, key_id: str, count: int, window_start):
+    db.add_all(
         AuthRateLimitCounter(
             scope="email",
             key_id=key_id,
             identifier_digest=index.to_bytes(32, "big"),
-            window_start=stale_window,
+            window_start=window_start,
             request_count=1,
         )
-        for index in range(501)
-    ]
-    current_row = AuthRateLimitCounter(
-        scope="ip",
-        key_id=key_id,
-        identifier_digest=(501).to_bytes(32, "big"),
-        window_start=current_window,
-        request_count=1,
+        for index in range(count)
     )
+
+
+def _delete_cleanup_test_rows(key_id: str) -> None:
+    with _TestSession() as db:
+        db.execute(
+            delete(AuthRateLimitCounter).where(AuthRateLimitCounter.key_id == key_id)
+        )
+        db.commit()
+
+
+def _drain_expired_cleanup_rows() -> None:
+    """Start cleanup integration cases without stale rows from earlier test runs."""
+    for _ in range(1000):
+        with _TestSession() as db:
+            deleted = cleanup_expired_rate_limit_counters(db)
+        if deleted < 500:
+            return
+    raise AssertionError("test database contains an unexpectedly large stale counter backlog")
+
+
+def test_cleanup_handles_empty_table_and_fewer_than_one_batch():
+    small_key_id = f"cleansmall_{uuid4().hex[:8]}"
+    stale_window = fixed_window_start(datetime.now(UTC) - timedelta(days=2))
+    current_window = fixed_window_start(datetime.now(UTC))
     try:
+        _drain_expired_cleanup_rows()
         with _TestSession() as db:
-            db.add_all([*stale_rows, current_row])
+            assert cleanup_expired_rate_limit_counters(db) == 0
+
+        with _TestSession() as db:
+            _cleanup_test_rows(db, small_key_id, 3, stale_window)
+            db.add(
+                AuthRateLimitCounter(
+                    scope="ip",
+                    key_id=small_key_id,
+                    identifier_digest=(3).to_bytes(32, "big"),
+                    window_start=current_window,
+                    request_count=1,
+                )
+            )
             db.commit()
-            assert cleanup_expired_rate_limit_counters(db, batch_size=500) == 500
-            remaining_stale = db.scalar(
+            assert cleanup_expired_rate_limit_counters(db) == 3
+            assert cleanup_expired_rate_limit_counters(db) == 0
+            assert db.scalar(
                 select(func.count())
                 .select_from(AuthRateLimitCounter)
-                .where(
-                    AuthRateLimitCounter.key_id == key_id,
-                    AuthRateLimitCounter.window_start == stale_window,
-                )
-            )
-            current_count = db.scalar(
-                select(func.count())
-                .select_from(AuthRateLimitCounter)
-                .where(
-                    AuthRateLimitCounter.key_id == key_id,
-                    AuthRateLimitCounter.window_start == current_window,
-                )
-            )
-            assert remaining_stale == 1
-            assert current_count == 1
+                .where(AuthRateLimitCounter.key_id == small_key_id)
+            ) == 1
     finally:
+        _delete_cleanup_test_rows(small_key_id)
+
+
+def test_cleanup_deletes_at_most_500_rows_per_invocation_until_empty():
+    key_id = f"cleanmulti_{uuid4().hex[:8]}"
+    stale_window = fixed_window_start(datetime.now(UTC) - timedelta(days=2))
+    try:
+        _drain_expired_cleanup_rows()
         with _TestSession() as db:
+            _cleanup_test_rows(db, key_id, 1001, stale_window)
+            db.commit()
+
+        batches = []
+        for _ in range(4):
+            with _TestSession() as db:
+                batches.append(cleanup_expired_rate_limit_counters(db))
+
+        assert batches == [500, 500, 1, 0]
+        assert all(0 <= deleted <= 500 for deleted in batches)
+    finally:
+        _delete_cleanup_test_rows(key_id)
+
+
+def test_cleanup_uses_one_exact_strict_retention_cutoff_per_transaction():
+    key_id = f"cleancutoff_{uuid4().hex[:8]}"
+    cutoff_boundary_digest = (0).to_bytes(32, "big")
+    older_digest = (1).to_bytes(32, "big")
+    try:
+        _drain_expired_cleanup_rows()
+        with _TestSession() as db:
+            # Both values and cleanup's cutoff use the same transaction timestamp;
+            # use a non-UTC session zone to verify comparison remains instant-based.
+            db.execute(text("SET LOCAL TIME ZONE 'Asia/Kolkata'"))
             db.execute(
-                delete(AuthRateLimitCounter).where(
+                insert(AuthRateLimitCounter).values(
+                    [
+                        {
+                            "scope": "email",
+                            "key_id": key_id,
+                            "identifier_digest": cutoff_boundary_digest,
+                            "window_start": func.transaction_timestamp()
+                            - text("INTERVAL '24 hours'"),
+                            "request_count": 1,
+                        },
+                        {
+                            "scope": "email",
+                            "key_id": key_id,
+                            "identifier_digest": older_digest,
+                            "window_start": func.transaction_timestamp()
+                            - text("INTERVAL '24 hours 1 microsecond'"),
+                            "request_count": 1,
+                        },
+                    ]
+                )
+            )
+            assert cleanup_expired_rate_limit_counters(db) == 1
+            remaining = db.scalars(
+                select(AuthRateLimitCounter).where(
                     AuthRateLimitCounter.key_id == key_id
                 )
-            )
+            ).all()
+            assert len(remaining) == 1
+            assert remaining[0].identifier_digest == cutoff_boundary_digest
+    finally:
+        _delete_cleanup_test_rows(key_id)
+
+
+def test_concurrent_cleanup_skips_locked_rows_then_cleans_them_later():
+    key_id = f"cleanskip_{uuid4().hex[:8]}"
+    stale_window = fixed_window_start(datetime.now(UTC) - timedelta(days=2))
+    locker = _TestSession()
+    try:
+        _drain_expired_cleanup_rows()
+        with _TestSession() as db:
+            _cleanup_test_rows(db, key_id, 5, stale_window)
             db.commit()
+
+        locked = locker.scalars(
+            select(AuthRateLimitCounter)
+            .where(AuthRateLimitCounter.key_id == key_id)
+            .order_by(AuthRateLimitCounter.identifier_digest)
+            .limit(2)
+            .with_for_update()
+        ).all()
+        assert len(locked) == 2
+
+        # This second session runs while the first still holds row locks. SKIP LOCKED
+        # must let it remove the other eligible rows rather than waiting on them.
+        with _TestSession() as db:
+            assert cleanup_expired_rate_limit_counters(db, batch_size=5) == 3
+
+        locker.rollback()
+        with _TestSession() as db:
+            assert cleanup_expired_rate_limit_counters(db, batch_size=5) == 2
+            assert cleanup_expired_rate_limit_counters(db, batch_size=5) == 0
+    finally:
+        locker.rollback()
+        locker.close()
+        _delete_cleanup_test_rows(key_id)
+
+
+def test_cleanup_database_failure_rolls_back_the_delete():
+    suffix = uuid4().hex[:10]
+    key_id = f"cleanfail_{suffix}"
+    function_name = f"fail_cleanup_delete_{suffix}"
+    trigger_name = f"fail_cleanup_delete_{suffix}"
+    stale_window = fixed_window_start(datetime.now(UTC) - timedelta(days=2))
+    _drain_expired_cleanup_rows()
+    with _TestSession() as db:
+        _cleanup_test_rows(db, key_id, 4, stale_window)
+        db.commit()
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"CREATE FUNCTION {function_name}() RETURNS trigger "
+                    "LANGUAGE plpgsql AS $$ BEGIN "
+                    f"IF OLD.key_id = '{key_id}' THEN "
+                    "RAISE EXCEPTION 'simulated cleanup failure'; "
+                    "END IF; RETURN OLD; END; $$"
+                )
+            )
+            connection.execute(
+                text(
+                    f"CREATE TRIGGER {trigger_name} AFTER DELETE "
+                    "ON auth_rate_limit_counters FOR EACH ROW "
+                    f"EXECUTE FUNCTION {function_name}()"
+                )
+            )
+
+        with _TestSession() as db:
+            with pytest.raises(RateLimitStorageError, match="temporarily unavailable"):
+                cleanup_expired_rate_limit_counters(db)
+
+        with _TestSession() as db:
+            assert db.scalar(
+                select(func.count())
+                .select_from(AuthRateLimitCounter)
+                .where(AuthRateLimitCounter.key_id == key_id)
+            ) == 4
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"DROP TRIGGER IF EXISTS {trigger_name} "
+                    "ON auth_rate_limit_counters"
+                )
+            )
+            connection.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
+        _delete_cleanup_test_rows(key_id)
