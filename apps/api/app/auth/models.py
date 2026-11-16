@@ -119,3 +119,43 @@ class AuthRateLimitCounter(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class AuthEmailDeliveryState(Base):
+    """Hashed per-email delivery reservation and cooldown state."""
+
+    __tablename__ = "auth_email_delivery_state"
+    __table_args__ = (
+        CheckConstraint(
+            "length(key_id) > 0", name="ck_auth_email_delivery_state_key_id"
+        ),
+        CheckConstraint(
+            "octet_length(identifier_digest) = 32",
+            name="ck_auth_email_delivery_state_digest_length",
+        ),
+        CheckConstraint(
+            "reservation_state IS NULL OR reservation_state IN ('reserved', 'sending')",
+            name="ck_auth_email_delivery_state_reservation_state",
+        ),
+        CheckConstraint(
+            "(reservation_id IS NULL AND reservation_state IS NULL "
+            "AND reservation_expires_at IS NULL) OR "
+            "(reservation_id IS NOT NULL AND reservation_state IS NOT NULL "
+            "AND reservation_state IN ('reserved', 'sending') "
+            "AND reservation_expires_at IS NOT NULL)",
+            name="ck_auth_email_delivery_state_reservation_fields",
+        ),
+        Index("ix_auth_email_delivery_state_cleanup", "updated_at"),
+    )
+
+    key_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    identifier_digest: Mapped[bytes] = mapped_column(LargeBinary(32), primary_key=True)
+    last_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reservation_id: Mapped[uuid.UUID | None] = mapped_column()
+    reservation_state: Mapped[str | None] = mapped_column(String(8))
+    reservation_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

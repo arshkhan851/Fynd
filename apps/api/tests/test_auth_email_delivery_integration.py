@@ -11,6 +11,7 @@ from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.models  # noqa: F401 - register ORM models and relationships
 from app.auth.email_delivery import (
     EMAIL_DELIVERY_ACCEPTED_COOLDOWN,
     EMAIL_DELIVERY_RESERVATION_LEASE,
