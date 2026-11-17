@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
 from app.auth.models import User
+from app.competition_visibility import public_competition_visibility_predicate
 from app.database import get_db
 from app.models import Competition, SavedCompetition
 from app.saved_opportunities.schemas import (
@@ -19,10 +20,6 @@ from app.saved_opportunities.schemas import (
 )
 
 router = APIRouter(prefix="/saved-opportunities", tags=["saved-opportunities"])
-
-
-def _visible_competition_filters():
-    return (Competition.is_published.is_(True), Competition.title.is_not(None))
 
 
 def _raise_database_unavailable(db: Session) -> None:
@@ -45,7 +42,7 @@ def list_saved_opportunities(
 ) -> SavedOpportunityListResponse:
     filters = (
         SavedCompetition.user_id == current_user.id,
-        *_visible_competition_filters(),
+        public_competition_visibility_predicate(),
     )
     try:
         total = (
@@ -100,7 +97,10 @@ def save_opportunity(
     try:
         competition = db.scalar(
             select(Competition)
-            .where(Competition.id == competition_id, *_visible_competition_filters())
+            .where(
+                Competition.id == competition_id,
+                public_competition_visibility_predicate(),
+            )
             .with_for_update(read=True)
         )
         if competition is None:

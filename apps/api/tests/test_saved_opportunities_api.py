@@ -271,6 +271,30 @@ def test_unpublishing_hides_saved_competition_without_deleting_bookmark(
     assert _saved_count(db, user.id) == 1
 
 
+def test_saved_list_uses_published_and_titled_visibility_rule(saved_opportunities_db, client):
+    db = saved_opportunities_db
+    user = _login(client, db, email=f"saved-visibility-{uuid4().hex}@example.org")
+    visible = _public_competition(db, title="Visible saved event")
+    unpublished = _public_competition(db, title="Unpublished saved event")
+    untitled = _public_competition(db, title="Formerly titled saved event")
+
+    for competition in (visible, unpublished, untitled):
+        assert client.put(f"/api/v1/saved-opportunities/{competition.id}").status_code == 200
+
+    unpublished.is_published = False
+    untitled.title = None
+    db.flush()
+
+    response = client.get("/api/v1/saved-opportunities?limit=1&offset=0")
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["limit"] == 1
+    assert response.json()["offset"] == 0
+    assert [item["competition_id"] for item in response.json()["items"]] == [visible.id]
+    assert _saved_count(db, user.id) == 3
+
+
 def test_saved_opportunities_pagination_and_tie_order_are_stable(
     saved_opportunities_db, client
 ):

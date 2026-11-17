@@ -132,6 +132,70 @@ def test_unpublished_competition_is_excluded_from_list_and_detail(db_session, cl
     assert detailed.status_code == 404
 
 
+def test_public_visibility_rule_is_consistent_across_listing_detail_and_categories(
+    db_session, client
+):
+    category = Category(name="Visibility matrix", slug=f"visibility-{uuid4().hex}")
+    published_titled = _published_competition(title="Visible matrix event")
+    unpublished_titled = Competition(title="Unpublished matrix event")
+    published_untitled = _published_competition(title=None)
+    unpublished_untitled = Competition(title=None)
+    db_session.add_all(
+        [
+            category,
+            published_titled,
+            unpublished_titled,
+            published_untitled,
+            unpublished_untitled,
+        ]
+    )
+    db_session.flush()
+    db_session.add_all(
+        CompetitionCategory(competition_id=competition.id, category_id=category.id)
+        for competition in (
+            published_titled,
+            unpublished_titled,
+            published_untitled,
+            unpublished_untitled,
+        )
+    )
+    db_session.flush()
+
+    listing = client.get(
+        "/competitions", params={"category": category.slug, "limit": 1, "offset": 0}
+    )
+    category_response = client.get("/categories")
+    category_count = next(
+        item["competition_count"]
+        for item in category_response.json()
+        if item["slug"] == category.slug
+    )
+    detail_responses = {
+        competition.id: client.get(f"/competitions/{competition.id}")
+        for competition in (
+            published_titled,
+            unpublished_titled,
+            published_untitled,
+            unpublished_untitled,
+        )
+    }
+
+    assert listing.status_code == 200
+    assert listing.json()["total"] == category_count == 1
+    assert listing.json()["items"][0]["id"] == published_titled.id
+    assert listing.json()["limit"] == 1
+    assert listing.json()["offset"] == 0
+    assert detail_responses[published_titled.id].status_code == 200
+    assert all(
+        detail_responses[competition.id].status_code == 404
+        for competition in (
+            unpublished_titled,
+            published_untitled,
+            unpublished_untitled,
+        )
+    )
+
+
 def test_competitions_pagination_defaults_and_limits(db_session, client):
     _add_competitions(db_session)
 

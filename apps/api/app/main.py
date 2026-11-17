@@ -10,6 +10,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.auth.router import router as auth_router
+from app.competition_visibility import public_competition_visibility_predicate
 from app.database import check_database_connectivity, get_db
 from app.models import (
     Category,
@@ -159,9 +160,8 @@ def list_competitions(
     q: Annotated[str | None, Query()] = None,
     category: Annotated[str | None, Query()] = None,
 ) -> CompetitionListResponse:
-    visible_competitions = Competition.is_published.is_(True) & Competition.title.is_not(None)
     search_term = q.strip() if q else ""
-    filters = [visible_competitions]
+    filters = [public_competition_visibility_predicate()]
     if search_term:
         pattern = f"%{search_term}%"
         filters.append(
@@ -217,10 +217,7 @@ def list_categories(session: Annotated[Session, Depends(get_db)]) -> list[Catego
             func.count(CompetitionCategory.competition_id).label("competition_count"),
         )
         .join(Competition, Competition.id == CompetitionCategory.competition_id)
-        .where(
-            Competition.is_published.is_(True),
-            Competition.title.is_not(None),
-        )
+        .where(public_competition_visibility_predicate())
         .group_by(CompetitionCategory.category_id)
         .subquery()
     )
@@ -257,8 +254,7 @@ def get_competition(
         select(Competition)
         .where(
             Competition.id == competition_id,
-            Competition.is_published.is_(True),
-            Competition.title.is_not(None),
+            public_competition_visibility_predicate(),
         )
         .options(
             selectinload(Competition.category_links).selectinload(
