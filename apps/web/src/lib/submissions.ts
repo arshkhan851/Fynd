@@ -1,6 +1,7 @@
 import { CURRENT_CONSENT_DECLARATION_TEXT, CURRENT_CONSENT_DECLARATION_VERSION } from "./submission-consent";
 
 export type AuthenticatedUser = { id: string; email: string; is_admin: boolean };
+export const AUTH_LOGOUT_EVENT = "fynd:auth-logout";
 
 export type SubmissionCreatePayload = {
   title: string;
@@ -113,6 +114,11 @@ export async function getCurrentUser(baseUrl: string): Promise<AuthenticatedUser
     if (error instanceof Error) throw error;
     throw new Error("Could not reach the API");
   }
+}
+
+export async function logoutCurrentUser(baseUrl: string): Promise<void> {
+  const response = await apiFetch(baseUrl, "/api/v1/auth/logout", { method: "POST" });
+  if (!response.ok) throw new Error("Could not log out. Please try again.");
 }
 
 export async function requestMagicLink(baseUrl: string, email: string): Promise<void> {

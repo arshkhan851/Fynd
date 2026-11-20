@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { AccountControl } from "./account-control";
 
 export function SiteHeader() {
   return (
@@ -13,6 +14,7 @@ export function SiteHeader() {
           <Link href="/saved-opportunities">Saved Opportunities</Link>
           <Link href="/submit">Submit an event</Link>
         </nav>
+        <AccountControl apiBaseUrl={process.env.API_BASE_URL ?? ""} />
       </div>
     </header>
   );

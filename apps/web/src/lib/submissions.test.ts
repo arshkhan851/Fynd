@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { toggleCategory } from "./category-selection";
-import { createSubmission, getCurrentUser, requestMagicLink, verifyMagicLink, verifyMagicLinkOnce } from "./submissions";
+import { createSubmission, getCurrentUser, logoutCurrentUser, requestMagicLink, verifyMagicLink, verifyMagicLinkOnce } from "./submissions";
 import { CURRENT_CONSENT_DECLARATION_TEXT, CURRENT_CONSENT_DECLARATION_VERSION } from "./submission-consent";
 
 afterEach(() => vi.restoreAllMocks());
@@ -17,6 +17,23 @@ describe("submission API client", () => {
   it("returns signed out for an unauthorized session", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 401 }));
     expect(await getCurrentUser("http://api.test")).toBeNull();
+  });
+
+  it("does not treat server errors as signed out", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 503 }));
+    await expect(getCurrentUser("http://api.test")).rejects.toThrow("HTTP 503");
+  });
+
+  it("logs out through the credentialed auth endpoint", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ message: "Logged out" }));
+    await logoutCurrentUser("http://api.test");
+    expect(fetch.mock.calls[0][0]).toEqual(new URL("http://api.test/api/v1/auth/logout"));
+    expect(fetch.mock.calls[0][1]).toMatchObject({ method: "POST", credentials: "include", cache: "no-store" });
+  });
+
+  it("sanitizes logout failures", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 503 }));
+    await expect(logoutCurrentUser("http://api.test")).rejects.toThrow("Could not log out. Please try again.");
   });
 
   it("requests and verifies magic links against existing auth endpoints", async () => {

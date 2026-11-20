@@ -90,6 +90,40 @@ button:focus-visible {
   text-underline-offset: 4px;
 }
 
+.account-control,
+.account-control__link,
+.account-control__placeholder,
+.account-control__unavailable {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.account-control { position: relative; }
+.account-control > summary { cursor: pointer; list-style: none; }
+.account-control > summary::-webkit-details-marker { display: none; }
+.account-control__link:hover,
+.account-control > summary:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 4px; }
+.account-control__menu {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 14px);
+  right: 0;
+  display: grid;
+  min-width: 220px;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+  box-shadow: 0 8px 24px rgb(39 40 33 / 10%);
+}
+.account-control__menu a:hover,
+.account-control__menu button:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 4px; }
+.account-control__menu button,
+.account-control__unavailable button { padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.account-control__menu button:disabled { cursor: wait; opacity: .65; }
+.account-control__email { margin: 0; overflow-wrap: anywhere; color: var(--ink); }
+.account-control__error { margin: 0; color: #8c3b2d; font-size: 12px; }
+
 .page-shell {
   width: min(100% - 48px, 1160px);
   margin: 0 auto;
@@ -677,6 +711,22 @@ button:focus-visible {
 
   .site-header__inner {
     min-height: 64px;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    padding: 10px 0;
+  }
+
+  .site-nav {
+    order: 3;
+    width: 100%;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 12px;
+  }
+
+  .account-control__menu {
+    right: 0;
+    max-width: calc(100vw - 32px);
   }
 
   .home-hero {

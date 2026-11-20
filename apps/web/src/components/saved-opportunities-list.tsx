@@ -9,6 +9,7 @@ import {
   SavedOpportunitiesApiError,
   type SavedOpportunityPage,
 } from "../lib/saved-opportunities";
+import { AUTH_LOGOUT_EVENT } from "../lib/submissions";
 
 const PAGE_SIZE = 20;
 
@@ -193,6 +194,7 @@ export function SavedOpportunitiesList({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [removingId, setRemovingId] = useState<number | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const removeInFlight = useRef(false);
+  const requestGeneration = useRef(0);
   const offsetRef = useRef(offset);
   const stateRef = useRef(state);
 
@@ -203,12 +205,13 @@ export function SavedOpportunitiesList({ apiBaseUrl }: { apiBaseUrl: string }) {
 
   useEffect(() => {
     let active = true;
+    const generation = ++requestGeneration.current;
     getSavedOpportunities(apiBaseUrl, PAGE_SIZE, offset)
       .then((page) => {
-        if (active) updateState({ type: page.items.length === 0 ? "empty" : "results", page });
+        if (active && generation === requestGeneration.current) updateState({ type: page.items.length === 0 ? "empty" : "results", page });
       })
       .catch((error: unknown) => {
-        if (!active) return;
+        if (!active || generation !== requestGeneration.current) return;
         if (error instanceof SavedOpportunitiesApiError && error.status === 401) {
           updateState({ type: "signed-out" });
         } else {
@@ -220,6 +223,18 @@ export function SavedOpportunitiesList({ apiBaseUrl }: { apiBaseUrl: string }) {
       });
     return () => { active = false; };
   }, [apiBaseUrl, offset, updateState]);
+
+  useEffect(() => {
+    const handleLogout = () => {
+      requestGeneration.current += 1;
+      offsetRef.current = 0;
+      setOffset(0);
+      updateState({ type: "signed-out" });
+      setActionError(null);
+    };
+    window.addEventListener(AUTH_LOGOUT_EVENT, handleLogout);
+    return () => window.removeEventListener(AUTH_LOGOUT_EVENT, handleLogout);
+  }, [updateState]);
 
   const visibleState =
     (state.type === "empty" || state.type === "results") && state.page.offset !== offset
