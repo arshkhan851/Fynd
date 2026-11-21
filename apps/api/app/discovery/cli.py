@@ -37,8 +37,8 @@ def _load_candidates(path: Path) -> tuple[list[DiscoveryCandidate], int]:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Persist candidates from JSON or Kaggle's official competition API. "
-            "This command does not perform field extraction or verification."
+            "Fetch and persist candidates from Kaggle's official competition API. "
+            "External-source JSON persistence is currently disabled."
         )
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
@@ -49,13 +49,19 @@ def main() -> int:
     parser.add_argument(
         "--allowed-host",
         action="append",
-        help="Allowed source hostname or parent domain for --input; repeat as needed",
+        help="URL safety allowlist for JSON input (does not grant source permission)",
     )
     parser.add_argument(
         "--limit", type=int, default=50, help="Maximum Kaggle candidates (default: 50)"
     )
     parser.add_argument("--page-size", type=int, default=20, help="Kaggle page size (max: 200)")
     args = parser.parse_args()
+
+    if args.input is not None:
+        parser.error(
+            "external-source JSON imports are disabled until the authorization system "
+            "can establish the required permissions"
+        )
 
     source_skipped = 0
     allowed_hosts: set[str]

@@ -232,9 +232,32 @@ def test_candidate_loader_counts_malformed_entries(tmp_path):
     assert skipped == 5
 
 
-def test_json_import_rejects_organizer_source_kind_before_persistence(
-    tmp_path, monkeypatch, capsys
+@pytest.mark.parametrize("allowed_host", [None, "example.test"])
+def test_json_import_is_refused_before_database_or_persistence(
+    tmp_path, monkeypatch, capsys, allowed_host
 ):
+    source = tmp_path / "candidates.json"
+    # The file deliberately need not exist: the CLI must refuse before parsing it.
+    monkeypatch.setattr(
+        "sys.argv",
+        ["fynd-discovery", "--input", str(source)]
+        + ([] if allowed_host is None else ["--allowed-host", allowed_host]),
+    )
+
+    def persistence_must_not_run(*args, **kwargs):
+        pytest.fail("organizer JSON candidate reached persistence")
+
+    monkeypatch.setattr(cli, "persist_candidates", persistence_must_not_run)
+    monkeypatch.setattr(cli, "SessionLocal", persistence_must_not_run)
+
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+
+    assert error.value.code == 2
+    assert "external-source JSON imports are disabled" in capsys.readouterr().err
+
+
+def test_candidate_loader_still_rejects_organizer_claims(tmp_path):
     source = tmp_path / "organizer-candidate.json"
     source.write_text(
         json.dumps(
@@ -249,22 +272,8 @@ def test_json_import_rejects_organizer_source_kind_before_persistence(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        "sys.argv",
-        ["fynd-discovery", "--input", str(source), "--allowed-host", "example.test"],
-    )
-
-    def persistence_must_not_run(*args, **kwargs):
-        pytest.fail("organizer JSON candidate reached persistence")
-
-    monkeypatch.setattr(cli, "persist_candidates", persistence_must_not_run)
-    monkeypatch.setattr(cli, "SessionLocal", persistence_must_not_run)
-
-    with pytest.raises(SystemExit) as error:
-        cli.main()
-
-    assert error.value.code == 2
-    assert "candidate 1 cannot claim source_kind='organizer'" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="cannot claim source_kind='organizer'"):
+        _load_candidates(source)
 
 
 def _kaggle_competition(title, url, ref):
