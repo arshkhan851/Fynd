@@ -34,6 +34,8 @@ ACCESS_METHODS = frozenset(
 ROBOTS_RESULTS = frozenset({"allowed", "disallowed", "no_file", "not_applicable", "unknown"})
 TERMS_DECISIONS = frozenset({"allowed", "permission_required", "prohibited", "unclear", "unknown"})
 GRANT_STATUSES = frozenset({"none", "requested", "granted", "denied", "expired", "revoked"})
+SOURCE_OPERATIONS = frozenset({"fetch", "store", "internal_review", "public_display"})
+OPERATION_PERMISSION_STATES = frozenset({"allowed", "denied", "unknown"})
 TRIGGERS = frozenset({"manual", "scheduled"})
 FREQUENCIES = ("monthly", "weekly", "daily", "hourly")
 WEB_METHODS = frozenset({"feed", "sitemap", "structured_html", "html"})
@@ -375,21 +377,48 @@ def _validate_source(raw: Any, root: Path, today: date) -> SourceRecord:
     if frequency not in FREQUENCIES:
         raise RegistryError(f"source {source_id} has unknown frequency '{frequency}'")
 
-    permission = _require_keys(
-        base["permission"],
-        {
-            "robots_checked_on",
-            "robots_result",
-            "terms_url",
-            "terms_reviewed_on",
-            "terms_decision",
-            "terms_notes",
-            "previous_terms_decision",
-            "terms_change_reference",
-            "grant",
-        },
-        f"source {source_id} permission",
-    )
+    permission_required_keys = {
+        "robots_checked_on",
+        "robots_result",
+        "terms_url",
+        "terms_reviewed_on",
+        "terms_decision",
+        "terms_notes",
+        "previous_terms_decision",
+        "terms_change_reference",
+        "grant",
+    }
+    raw_permission = base["permission"]
+    if not isinstance(raw_permission, dict):
+        raise RegistryError(f"source {source_id} permission must be a table")
+    missing_permission_keys = permission_required_keys - raw_permission.keys()
+    extra_permission_keys = raw_permission.keys() - permission_required_keys - {"operations"}
+    if missing_permission_keys or extra_permission_keys:
+        details = []
+        if missing_permission_keys:
+            details.append(f"missing keys: {', '.join(sorted(missing_permission_keys))}")
+        if extra_permission_keys:
+            details.append(f"unknown keys: {', '.join(sorted(extra_permission_keys))}")
+        raise RegistryError(f"source {source_id} permission: {'; '.join(details)}")
+    raw_operations = raw_permission.get("operations", {})
+    if not isinstance(raw_operations, dict):
+        raise RegistryError(f"source {source_id} permission.operations must be a table")
+    unknown_operations = raw_operations.keys() - SOURCE_OPERATIONS
+    if unknown_operations:
+        raise RegistryError(
+            f"source {source_id} permission.operations contains unknown operations: "
+            f"{', '.join(sorted(unknown_operations))}"
+        )
+    operations: dict[str, str] = {}
+    for operation in SOURCE_OPERATIONS:
+        state = raw_operations.get(operation, "unknown")
+        if not isinstance(state, str) or state not in OPERATION_PERMISSION_STATES:
+            raise RegistryError(
+                f"source {source_id} permission operation '{operation}' must be "
+                "allowed, denied, or unknown"
+            )
+        operations[operation] = state
+    permission = {**raw_permission, "operations": operations}
     robots_result = _string(permission["robots_result"], f"source {source_id} robots_result")
     terms_decision = _string(permission["terms_decision"], f"source {source_id} terms_decision")
     if robots_result not in ROBOTS_RESULTS:
@@ -1349,11 +1378,36 @@ def authorization_decision(
     *,
     today: date | None = None,
     environ: Any = None,
+    operation: str | None = None,
 ) -> AuthorizationDecision:
     """Return a fail-closed decision and actionable refusal reasons."""
     today = today or date.today()
     environ = os.environ if environ is None else environ
     reasons: list[str] = []
+    if operation is not None:
+        if operation not in SOURCE_OPERATIONS:
+            reasons.append(f"unknown source operation '{operation}'")
+        else:
+            permission_data = source.permission
+            if isinstance(permission_data, dict):
+                operations = permission_data.get("operations", {})
+            else:
+                operations = {}
+            if isinstance(operations, dict):
+                operation_state = operations.get(operation, "unknown")
+            else:
+                operation_state = "unknown"
+            if operation_state != "allowed":
+                reasons.append(f"{operation} permission is {operation_state}; operation is denied")
+            if (
+                operation_state == "allowed"
+                and isinstance(permission_data, dict)
+                and permission_data.get("terms_decision") == "prohibited"
+            ):
+                reasons.append(
+                    "conflicting permission evidence: "
+                    f"{operation} is allowed while source terms are prohibited"
+                )
     # Direct callers must receive the same structural checks as records loaded from TOML.
     try:
         if not source.access["allowed_hosts"] or any(
@@ -1481,14 +1535,42 @@ def authorize_source_execution(
     """
     if registry_path is None:
         registry_path = Path(__file__).resolve().parents[4] / "docs" / "sources" / "registry.toml"
+    return authorize_source_operation(
+        source_id,
+        "fetch",
+        registry_path,
+        today=today,
+        environ=environ,
+    )
+
+
+def authorize_source_operation(
+    source_id: str,
+    operation: str,
+    registry_path: str | Path | None = None,
+    *,
+    today: date | None = None,
+    environ: Any = None,
+) -> SourceRecord:
+    """Authorize one explicit source operation, defaulting absent permissions to denied."""
+    if operation not in SOURCE_OPERATIONS:
+        raise RegistryError(f"unknown source operation '{operation}'")
+    if registry_path is None:
+        registry_path = Path(__file__).resolve().parents[4] / "docs" / "sources" / "registry.toml"
     registry = load_registry(registry_path, today=today)
     source = registry.get_source(source_id)
     if source is None:
         raise RegistryError(f"source {source_id} is not registered")
-    decision = authorization_decision(registry, source, today=today, environ=environ)
+    decision = authorization_decision(
+        registry,
+        source,
+        today=today,
+        environ=environ,
+        operation=operation,
+    )
     if not decision.allowed:
         raise RegistryError(
-            f"source {source_id} execution refused: {'; '.join(decision.reasons)}"
+            f"source {source_id} {operation} refused: {'; '.join(decision.reasons)}"
         )
     return source
 

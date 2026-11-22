@@ -18,6 +18,8 @@ from app.discovery.registry import (
     _validate_robots_section,
     _validate_terms_section,
     authorization_decision,
+    authorize_source_execution,
+    authorize_source_operation,
     load_registry,
 )
 from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS
@@ -104,6 +106,12 @@ terms_decision = "allowed"
 terms_notes = "Reviewed official client terms permit this use"
 previous_terms_decision = ""
 terms_change_reference = ""
+
+[source.permission.operations]
+fetch = "unknown"
+store = "unknown"
+internal_review = "unknown"
+public_display = "unknown"
 
 [source.permission.grant]
 status = "none"
@@ -966,6 +974,13 @@ def test_every_existing_adapter_has_registry_entry_and_kaggle_stays_auditing() -
     kaggle = registered["app.discovery.kaggle"]
     assert kaggle.status == "auditing"
     assert kaggle.source_kind == "aggregator"
+    assert kaggle.permission["operations"] == {
+        "fetch": "unknown",
+        "store": "unknown",
+        "internal_review": "unknown",
+        "public_display": "unknown",
+    }
+    assert not authorization_decision(registry, kaggle, today=TODAY, operation="fetch").allowed
 
 
 def test_approved_source_must_pass_all_gate_conditions(tmp_path: Path) -> None:
@@ -1007,6 +1022,190 @@ def test_approved_source_must_pass_all_gate_conditions(tmp_path: Path) -> None:
     )
     assert not present_decision.allowed
     assert not any("TOKEN_FOR_TEST" in reason for reason in present_decision.reasons)
+
+
+@pytest.mark.parametrize(
+    "allowed_operation", ["fetch", "store", "internal_review", "public_display"]
+)
+def test_operation_permission_explicit_allow_and_independent_gates(
+    tmp_path, monkeypatch, allowed_operation
+):
+    registry = _load_valid(tmp_path)
+    source = registry.sources[0]
+    monkeypatch.setattr(
+        "app.discovery.registry._permission_establishes_numeric_limits", lambda _source: True
+    )
+    monkeypatch.setattr("app.discovery.registry._require_audit_sections", lambda *_args: None)
+    source = replace(
+        source,
+        homepage_url="https://sample.org",
+        access={**source.access, "allowed_hosts": ["sample.org"]},
+        permission={**source.permission, "terms_url": "https://sample.org/terms"},
+    )
+    states = {operation: "unknown" for operation in source.permission["operations"]}
+    states[allowed_operation] = "allowed"
+    source = replace(
+        source,
+        permission={**source.permission, "operations": states},
+    )
+
+    for operation in states:
+        decision = authorization_decision(registry, source, today=TODAY, operation=operation)
+        assert decision.allowed is (operation == allowed_operation)
+        if operation != allowed_operation:
+            assert any(
+                f"{operation} permission is unknown" in reason for reason in decision.reasons
+            )
+
+
+@pytest.mark.parametrize("state", ["denied", "unknown"])
+def test_operation_permission_denied_and_unknown_states_fail_closed(tmp_path, monkeypatch, state):
+    registry = _load_valid(tmp_path)
+    source = registry.sources[0]
+    monkeypatch.setattr(
+        "app.discovery.registry._permission_establishes_numeric_limits", lambda _source: True
+    )
+    operations = {**source.permission["operations"], "store": state}
+    source = replace(source, permission={**source.permission, "operations": operations})
+
+    decision = authorization_decision(registry, source, today=TODAY, operation="store")
+    assert not decision.allowed
+    assert any(f"store permission is {state}" in reason for reason in decision.reasons)
+
+
+def test_missing_operation_permission_defaults_to_unknown(tmp_path):
+    content = _registry_text().replace('store = "unknown"\n', "")
+    registry = load_registry(_write_registry(tmp_path, content), today=TODAY)
+    operations = registry.sources[0].permission["operations"]
+
+    assert operations["store"] == "unknown"
+    assert operations["fetch"] == "unknown"
+
+
+def test_invalid_operation_permission_state_is_rejected(tmp_path):
+    content = _registry_text().replace('store = "unknown"', 'store = "maybe"')
+    with pytest.raises(RegistryError, match="allowed, denied, or unknown"):
+        load_registry(_write_registry(tmp_path, content), today=TODAY)
+
+
+def test_unknown_operation_is_denied(tmp_path):
+    registry = _load_valid(tmp_path)
+    decision = authorization_decision(
+        registry, registry.sources[0], today=TODAY, operation="publish"
+    )
+    assert not decision.allowed
+    assert any("unknown source operation" in reason for reason in decision.reasons)
+
+
+def test_malformed_direct_operation_permissions_fail_closed(tmp_path):
+    registry = _load_valid(tmp_path)
+    permission = {**registry.sources[0].permission, "operations": None}
+    source = replace(registry.sources[0], permission=permission)
+    decision = authorization_decision(registry, source, today=TODAY, operation="store")
+    assert not decision.allowed
+    assert any("store permission is unknown" in reason for reason in decision.reasons)
+
+
+def test_expired_existing_grant_denies_operation_permission(tmp_path, monkeypatch):
+    registry = _load_valid(tmp_path)
+    source = registry.sources[0]
+    monkeypatch.setattr(
+        "app.discovery.registry._permission_establishes_numeric_limits", lambda _source: True
+    )
+    grant = {
+        "status": "granted",
+        "requested_on": "2026-10-01",
+        "granted_on": "2026-10-01",
+        "expires_on": "2026-10-31",
+        "granted_by_role": "synthetic reviewer",
+        "scope": ["field:title", "trigger:manual", "frequency:weekly"],
+        "conditions": "",
+        "reference": "synthetic grant reference",
+        "evidence_stored_offrepo": True,
+    }
+    permission = {
+        **source.permission,
+        "terms_decision": "permission_required",
+        "grant": grant,
+        "operations": {**source.permission["operations"], "store": "allowed"},
+    }
+    source = replace(source, permission=permission)
+
+    decision = authorization_decision(registry, source, today=TODAY, operation="store")
+    assert not decision.allowed
+    assert any("permission grant has expired" in reason for reason in decision.reasons)
+
+
+def test_conflicting_allowed_operation_and_prohibited_terms_fail_closed(tmp_path, monkeypatch):
+    registry = _load_valid(tmp_path)
+    source = registry.sources[0]
+    monkeypatch.setattr(
+        "app.discovery.registry._permission_establishes_numeric_limits", lambda _source: True
+    )
+    permission = {
+        **source.permission,
+        "terms_decision": "prohibited",
+        "operations": {**source.permission["operations"], "store": "allowed"},
+    }
+    source = replace(source, permission=permission)
+
+    decision = authorization_decision(registry, source, today=TODAY, operation="store")
+    assert not decision.allowed
+    assert any("conflicting permission evidence" in reason for reason in decision.reasons)
+
+
+def test_operation_authorizer_requires_explicit_permission(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.discovery.registry._permission_establishes_numeric_limits", lambda _source: True
+    )
+    monkeypatch.setattr("app.discovery.registry._require_audit_sections", lambda *_args: None)
+    content = (
+        _registry_text(
+            status="approved",
+            contact="https://fynd.org/contact",
+            checked="2026-10-31",
+        )
+        .replace("sample.test", "sample.org")
+        .replace('store = "unknown"', 'store = "allowed"')
+    )
+    path = _write_registry(tmp_path, content)
+
+    source = authorize_source_operation("sample", "store", path, today=TODAY)
+    assert source.permission["operations"]["store"] == "allowed"
+    with pytest.raises(RegistryError, match="fetch permission is unknown"):
+        authorize_source_operation("sample", "fetch", path, today=TODAY)
+
+
+def test_source_execution_authorizer_uses_fetch_permission_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.discovery.registry._permission_establishes_numeric_limits", lambda _source: True
+    )
+    base = _registry_text(
+        status="approved",
+        contact="https://fynd.org/contact",
+        checked="2026-10-31",
+    ).replace("sample.test", "sample.org")
+
+    fetch_allowed_path = _write_registry(
+        tmp_path / "fetch-allowed", base.replace('fetch = "unknown"', 'fetch = "allowed"')
+    )
+    assert authorize_source_execution(
+        "sample", fetch_allowed_path, today=TODAY
+    ).permission["operations"]["fetch"] == "allowed"
+
+    denied_paths = [
+        _write_registry(tmp_path / "fetch-unknown", base),
+        *[
+            _write_registry(
+                tmp_path / operation,
+                base.replace(f'{operation} = "unknown"', f'{operation} = "allowed"'),
+            )
+            for operation in ("store", "internal_review", "public_display")
+        ],
+    ]
+    for path in denied_paths:
+        with pytest.raises(RegistryError, match="fetch permission is unknown"):
+            authorize_source_execution("sample", path, today=TODAY)
 
 
 def test_whitespace_only_approver_is_trimmed_and_rejected(tmp_path: Path) -> None:

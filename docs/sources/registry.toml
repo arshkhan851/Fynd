@@ -35,6 +35,12 @@ terms_notes = ""
 previous_terms_decision = ""
 terms_change_reference = ""
 
+[source.permission.operations]
+fetch = "unknown"
+store = "unknown"
+internal_review = "unknown"
+public_display = "unknown"
+
 [source.permission.grant]
 status = "none"
 requested_on = ""
