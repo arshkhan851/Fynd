@@ -326,6 +326,7 @@ def test_kaggle_adapter_maps_documented_fields_and_paginates():
     ]
     assert [candidate.external_id for candidate in batch.candidates] == ["first", "second"]
     assert [candidate.publisher_name for candidate in batch.candidates] == ["Kaggle", "Kaggle"]
+    assert batch.registry_source_id == "kaggle"
     assert batch.pages_fetched == 2
     assert batch.skipped == 0
     assert calls[0]["page_token"] is None

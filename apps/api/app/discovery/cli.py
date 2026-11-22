@@ -64,6 +64,7 @@ def main() -> int:
         )
 
     source_skipped = 0
+    registry_source_id: str | None = None
     allowed_hosts: set[str]
     try:
         if args.kaggle:
@@ -78,6 +79,7 @@ def main() -> int:
                 result_limit=args.limit,
             ).discover()
             candidates = list(batch.candidates)
+            registry_source_id = batch.registry_source_id
             source_skipped = batch.skipped
             allowed_hosts = {"kaggle.com"}
         else:
@@ -95,7 +97,15 @@ def main() -> int:
         return 1
     try:
         with SessionLocal() as session:
-            summary = persist_candidates(session, candidates, allowed_hosts)
+            summary = persist_candidates(
+                session,
+                candidates,
+                allowed_hosts,
+                registry_source_id=registry_source_id,
+            )
+    except RegistryError as exc:
+        print(f"Discovery authorization refused: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
         print(f"Discovery persistence failed: {type(exc).__name__}", file=sys.stderr)
         return 1

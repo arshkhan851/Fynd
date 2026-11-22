@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -68,3 +69,48 @@ def test_guard_precedes_authentication_when_guard_allows(monkeypatch):
 
     KaggleDiscoveryAdapter(api=api).discover()
     assert order == ["guard", "authenticate"]
+
+
+def test_cli_passes_adapter_registry_identity_separately_to_persistence(monkeypatch, capsys):
+    captured = {}
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeAdapter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def discover(self):
+            return SimpleNamespace(
+                candidates=(),
+                skipped=0,
+                registry_source_id="kaggle",
+            )
+
+    monkeypatch.setattr(sys, "argv", ["fynd-discovery", "--kaggle"])
+    monkeypatch.setattr(cli, "authorize_source_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "KaggleDiscoveryAdapter", FakeAdapter)
+    monkeypatch.setattr(cli, "SessionLocal", FakeSession)
+
+    def persist(_session, candidates, allowed_hosts, *, registry_source_id):
+        captured.update(
+            candidates=candidates,
+            allowed_hosts=allowed_hosts,
+            registry_source_id=registry_source_id,
+        )
+        return SimpleNamespace(discovered=0, existing=0, failed=0)
+
+    monkeypatch.setattr(cli, "persist_candidates", persist)
+
+    assert cli.main() == 0
+    assert captured == {
+        "candidates": [],
+        "allowed_hosts": {"kaggle.com"},
+        "registry_source_id": "kaggle",
+    }
+    assert '"discovered": 0' in capsys.readouterr().out

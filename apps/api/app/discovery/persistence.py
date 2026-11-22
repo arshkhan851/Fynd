@@ -8,7 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.discovery.candidates import DiscoveryCandidate
-from app.discovery.urls import normalize_source_url
+from app.discovery.registry import RegistryError, authorize_source_operation
+from app.discovery.urls import UnsafeSourceUrl, normalize_source_url
 from app.models import Competition, CompetitionSource, FieldEvidence, SourcePublisher
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,55 @@ def persist_candidates(
     session: Session,
     candidates: Iterable[DiscoveryCandidate],
     allowed_hosts: set[str],
+    *,
+    registry_source_id: str | None = None,
 ) -> DiscoverySummary:
+    if not isinstance(registry_source_id, str) or not registry_source_id.strip():
+        raise RegistryError("trusted registry source identity is required")
+    if registry_source_id != registry_source_id.strip():
+        raise RegistryError("trusted registry source identity is invalid")
+
+    # Persistence is an independent authorization boundary: a successful fetch check
+    # does not grant either storage or internal-review permission.
+    store_source = authorize_source_operation(registry_source_id, "store")
+    review_source = authorize_source_operation(registry_source_id, "internal_review")
+    if store_source.id != registry_source_id or review_source.id != registry_source_id:
+        raise RegistryError("source authorization resolved an unexpected registry identity")
+    if store_source != review_source:
+        raise RegistryError("source registry changed during persistence authorization")
+
+    if not isinstance(allowed_hosts, set) or any(
+        not isinstance(host, str) or not host.strip() for host in allowed_hosts
+    ):
+        raise ValueError("allowed_hosts must be a set of non-empty host strings")
+
+    candidate_list = list(candidates)
+    trusted_hosts = set(store_source.access.get("allowed_hosts", ()))
+    if not trusted_hosts:
+        raise RegistryError("authorized source has no registered URL hosts")
+    for candidate in candidate_list:
+        if not isinstance(candidate, DiscoveryCandidate):
+            raise TypeError("persistence accepts DiscoveryCandidate instances only")
+        if (
+            candidate.publisher_name.strip().casefold()
+            != store_source.publisher_name.strip().casefold()
+            or candidate.source_kind != store_source.source_kind
+        ):
+            raise RegistryError(
+                "candidate publisher or source kind does not match the trusted registry source"
+            )
+        try:
+            # Registry hosts are authoritative. The caller's existing allowlist remains
+            # an additional URL restriction in the per-candidate persistence path below.
+            normalize_source_url(candidate.source_url, trusted_hosts)
+        except UnsafeSourceUrl as exc:
+            raise RegistryError(
+                f"candidate source URL violates trusted registry host restrictions: {exc}"
+            ) from exc
+
+    if not candidate_list:
+        return DiscoverySummary()
+
     if session.get_bind().dialect.name != "postgresql":
         raise RuntimeError(
             "Discovery persistence requires PostgreSQL transaction-scoped advisory locks"
@@ -53,7 +102,7 @@ def persist_candidates(
     discovered = existing = failed = 0
     transaction = nullcontext() if session.in_transaction() else session.begin()
     with transaction:
-        for candidate_index, candidate in enumerate(candidates, start=1):
+        for candidate_index, candidate in enumerate(candidate_list, start=1):
             try:
                 normalized = normalize_source_url(candidate.source_url, allowed_hosts)
                 # Acquire before the global lookup and outside the candidate savepoint,

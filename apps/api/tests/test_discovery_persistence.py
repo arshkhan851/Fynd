@@ -10,7 +10,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal, engine
-from app.discovery import DiscoveryCandidate, persist_candidates, persistence
+from app.discovery import DiscoveryCandidate, persistence
+from app.discovery import persist_candidates as _persist_candidates
 from app.models import Competition, CompetitionSource, FieldEvidence, SourcePublisher
 from app.review.service import accept_evidence
 
@@ -32,6 +33,35 @@ def db_session():
 
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture(autouse=True)
+def synthetic_source_authorization(monkeypatch):
+    def authorize(source_id, operation):
+        prefix = "synthetic-test-source:"
+        assert source_id.startswith(prefix)
+        assert operation in {"store", "internal_review"}
+        return SimpleNamespace(
+            id=source_id,
+            publisher_name=source_id.removeprefix(prefix),
+            source_kind="aggregator",
+            access={"allowed_hosts": ["example.test"]},
+        )
+
+    monkeypatch.setattr(persistence, "authorize_source_operation", authorize)
+
+
+def persist_candidates(session, candidates, allowed_hosts):
+    candidate_list = list(candidates)
+    source_id = "synthetic-test-source:"
+    if candidate_list:
+        source_id += candidate_list[0].publisher_name.strip()
+    return _persist_candidates(
+        session,
+        candidate_list,
+        allowed_hosts,
+        registry_source_id=source_id,
+    )
 
 
 def test_repeat_source_urls_are_idempotent(db_session):
@@ -326,7 +356,11 @@ def test_persistence_requires_postgresql_for_advisory_locking():
     )
 
     with pytest.raises(RuntimeError, match="requires PostgreSQL"):
-        persist_candidates(non_postgres_session, [], {"example.test"})
+        persist_candidates(
+            non_postgres_session,
+            [DiscoveryCandidate("Event", "https://events.example.test/event", "Publisher")],
+            {"example.test"},
+        )
 
 
 def test_existing_source_url_on_another_competition_is_not_duplicated(db_session):

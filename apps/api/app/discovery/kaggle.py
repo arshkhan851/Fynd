@@ -12,6 +12,7 @@ from app.discovery.urls import UnsafeSourceUrl, validate_source_url
 
 KAGGLE_ALLOWED_HOSTS = {"kaggle.com"}
 KAGGLE_PUBLISHER_NAME = "Kaggle"
+KAGGLE_REGISTRY_SOURCE_ID = "kaggle"
 
 
 class KaggleDiscoveryError(RuntimeError):
@@ -39,6 +40,7 @@ class KaggleDiscoveryBatch:
     candidates: tuple[DiscoveryCandidate, ...]
     skipped: int
     pages_fetched: int
+    registry_source_id: str
 
 
 def _response_status(exc: Exception) -> int | None:
@@ -217,4 +219,5 @@ class KaggleDiscoveryAdapter:
             candidates=tuple(candidates),
             skipped=skipped,
             pages_fetched=pages_fetched,
+            registry_source_id=KAGGLE_REGISTRY_SOURCE_ID,
         )
