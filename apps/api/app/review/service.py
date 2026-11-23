@@ -151,6 +151,47 @@ def _apply_canonical_value(competition: Competition, evidence: FieldEvidence) ->
         setattr(competition, field_name, value)
 
 
+def _validate_event_date_precision(competition: Competition, evidence: FieldEvidence) -> None:
+    """Reject an event range whose resulting endpoints use different precision."""
+    if evidence.field_name not in {"event_starts", "event_ends"}:
+        return
+    if (
+        not isinstance(evidence.observed_value, dict)
+        or evidence.field_name not in evidence.observed_value
+    ):
+        raise ReviewError(
+            f"evidence value must contain the '{evidence.field_name}' field"
+        )
+    _, evidence_precision = _validate_date_evidence(
+        evidence.observed_value[evidence.field_name], evidence.field_name
+    )
+
+    start_precision = _canonical_event_date_precision(competition, "event_starts")
+    end_precision = _canonical_event_date_precision(competition, "event_ends")
+    if evidence.field_name == "event_starts":
+        start_precision = evidence_precision
+    else:
+        end_precision = evidence_precision
+
+    if start_precision is not None and end_precision is not None:
+        if start_precision != end_precision:
+            raise ReviewError(
+                "mixed-precision event range requires human resolution"
+            )
+
+
+def _canonical_event_date_precision(competition: Competition, field_name: str) -> str | None:
+    date_value = getattr(competition, f"{field_name}_on")
+    datetime_value = getattr(competition, f"{field_name}_at")
+    if date_value is not None and datetime_value is not None:
+        raise ReviewError(f"canonical {field_name} has conflicting date precision")
+    if date_value is not None:
+        return "on"
+    if datetime_value is not None:
+        return "at"
+    return None
+
+
 def _transaction(session: Session):
     return nullcontext() if session.in_transaction() else session.begin()
 
@@ -315,6 +356,7 @@ def accept_evidence(session: Session, evidence_id: int, *, commit: bool = True) 
                         "assigning a new primary category"
                     )
         else:
+            _validate_event_date_precision(competition, evidence)
             # Keep scalar evidence behavior unchanged.
             _apply_canonical_value(competition, evidence)
         previous = session.scalars(

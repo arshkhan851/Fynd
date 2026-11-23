@@ -9,6 +9,18 @@ from app.discovery.registry import RegistryError
 SOURCE_ID = "synthetic-source"
 PUBLISHER = "Synthetic Publisher"
 CANDIDATE_URL = "https://events.example.test/competition"
+ALL_FIELDS = {
+    "title",
+    "description",
+    "official_url",
+    "registration_url",
+    "registration_deadline",
+    "event_starts",
+    "event_ends",
+    "event_timezone",
+    "format",
+    "eligibility_summary",
+}
 
 
 class NoDatabaseSession:
@@ -22,6 +34,7 @@ def _source(source_id=SOURCE_ID):
         publisher_name=PUBLISHER,
         source_kind="aggregator",
         access={"allowed_hosts": ["example.test"]},
+        use={"fields": sorted(ALL_FIELDS)},
     )
 
 

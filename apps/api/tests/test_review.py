@@ -3,13 +3,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from integration_database_guard import guard_isolated_postgres_integration_tests
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.database import engine
-from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS
-from app.models import (
+guard_isolated_postgres_integration_tests()
+
+from app.database import engine  # noqa: E402
+from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS  # noqa: E402
+from app.models import (  # noqa: E402
     Category,
     Competition,
     CompetitionCategory,
@@ -17,7 +20,7 @@ from app.models import (
     FieldEvidence,
     SourcePublisher,
 )
-from app.review import (
+from app.review import (  # noqa: E402
     ReviewError,
     UnsupportedEvidenceField,
     accept_evidence,
@@ -27,7 +30,7 @@ from app.review import (
     reject_evidence,
     unassign_category,
 )
-from app.review import service as review_service
+from app.review import service as review_service  # noqa: E402
 
 pytestmark = pytest.mark.integration
 

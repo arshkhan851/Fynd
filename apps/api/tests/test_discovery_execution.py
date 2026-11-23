@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,7 +89,7 @@ def test_cli_passes_adapter_registry_identity_separately_to_persistence(monkeypa
         def discover(self):
             return SimpleNamespace(
                 candidates=(),
-                skipped=0,
+                skipped=2,
                 registry_source_id="kaggle",
             )
 
@@ -103,7 +104,13 @@ def test_cli_passes_adapter_registry_identity_separately_to_persistence(monkeypa
             allowed_hosts=allowed_hosts,
             registry_source_id=registry_source_id,
         )
-        return SimpleNamespace(discovered=0, existing=0, failed=0)
+        return SimpleNamespace(
+            discovered=0,
+            skipped=1,
+            skipped_fields=("format",),
+            existing=0,
+            failed=0,
+        )
 
     monkeypatch.setattr(cli, "persist_candidates", persist)
 
@@ -113,4 +120,11 @@ def test_cli_passes_adapter_registry_identity_separately_to_persistence(monkeypa
         "allowed_hosts": {"kaggle.com"},
         "registry_source_id": "kaggle",
     }
-    assert '"discovered": 0' in capsys.readouterr().out
+    assert json.loads(capsys.readouterr().out) == {
+        "discovered": 0,
+        "skipped": 2,
+        "skipped_observations": 1,
+        "skipped_fields": ["format"],
+        "existing": 0,
+        "failed": 0,
+    }

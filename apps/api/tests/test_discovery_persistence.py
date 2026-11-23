@@ -1,19 +1,36 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, date, datetime
 from threading import Event
 from time import monotonic, sleep
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from integration_database_guard import guard_isolated_postgres_integration_tests
 from sqlalchemy import delete, exists, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.database import SessionLocal, engine
-from app.discovery import DiscoveryCandidate, persistence
-from app.discovery import persist_candidates as _persist_candidates
-from app.models import Competition, CompetitionSource, FieldEvidence, SourcePublisher
-from app.review.service import accept_evidence
+guard_isolated_postgres_integration_tests()
+
+from app.database import SessionLocal, engine  # noqa: E402
+from app.discovery import DiscoveryCandidate, persistence  # noqa: E402
+from app.discovery import persist_candidates as _persist_candidates  # noqa: E402
+from app.discovery.candidates import (  # noqa: E402
+    DateObservationField,
+    DateOnlyObservation,
+    DateTimeObservation,
+    FormatObservation,
+    TextObservation,
+    UrlObservation,
+)
+from app.models import (  # noqa: E402
+    Competition,
+    CompetitionSource,
+    FieldEvidence,
+    SourcePublisher,
+)
+from app.review.service import accept_evidence  # noqa: E402
 
 
 @pytest.fixture
@@ -46,6 +63,20 @@ def synthetic_source_authorization(monkeypatch):
             publisher_name=source_id.removeprefix(prefix),
             source_kind="aggregator",
             access={"allowed_hosts": ["example.test"]},
+            use={
+                "fields": [
+                    "title",
+                    "description",
+                    "official_url",
+                    "registration_url",
+                    "registration_deadline",
+                    "event_starts",
+                    "event_ends",
+                    "event_timezone",
+                    "format",
+                    "eligibility_summary",
+                ]
+            },
         )
 
     monkeypatch.setattr(persistence, "authorize_source_operation", authorize)
@@ -144,6 +175,150 @@ def test_manual_import_creates_unpublished_competition(db_session):
     assert competition is not None
     assert competition.title is None
     assert competition.is_published is False
+
+
+def test_structured_observations_persist_as_candidate_evidence_only(db_session):
+    source_url = "https://events.example.test/2027/structured-observations"
+    candidate = DiscoveryCandidate(
+        "Structured event",
+        source_url,
+        "Structured Events",
+        description=TextObservation("Event details", "Description excerpt"),
+        official_url=UrlObservation("https://official.example.test/event", "Official excerpt"),
+        registration_url=UrlObservation(
+            "https://official.example.test/register", "Registration excerpt"
+        ),
+        registration_deadline=DateObservationField(
+            DateOnlyObservation(date(2027, 6, 10)), "Deadline excerpt"
+        ),
+        event_starts=DateObservationField(
+            DateTimeObservation(datetime(2027, 6, 11, 9, 30, tzinfo=UTC)), "Start excerpt"
+        ),
+        event_ends=DateObservationField(DateOnlyObservation(date(2027, 6, 13)), "End excerpt"),
+        event_timezone=TextObservation("Asia/Kolkata", "Timezone excerpt"),
+        format=FormatObservation("hybrid", "Format excerpt"),
+        eligibility_summary=TextObservation("Open to students", "Eligibility excerpt"),
+    )
+
+    summary = persist_candidates(db_session, [candidate], {"example.test"})
+
+    assert summary.discovered == 1
+    assert summary.skipped == 0
+    assert summary.failed == 0
+    source = db_session.scalar(
+        select(CompetitionSource).where(CompetitionSource.normalized_url == source_url)
+    )
+    assert source is not None
+    competition = db_session.get(Competition, source.competition_id)
+    assert competition is not None
+    assert competition.is_published is False
+    assert competition.title is None
+    assert competition.description is None
+    assert competition.official_url is None
+    assert competition.registration_url is None
+    assert competition.registration_deadline_on is None
+    assert competition.registration_deadline_at is None
+    assert competition.event_starts_on is None
+    assert competition.event_starts_at is None
+    assert competition.event_ends_on is None
+    assert competition.event_ends_at is None
+    assert competition.event_timezone is None
+    assert competition.format is None
+    assert competition.eligibility_summary is None
+
+    evidence_rows = db_session.scalars(
+        select(FieldEvidence)
+        .where(FieldEvidence.source_id == source.id)
+        .order_by(FieldEvidence.field_name)
+    ).all()
+    by_field = {row.field_name: row for row in evidence_rows}
+    assert set(by_field) == {
+        "title",
+        "description",
+        "official_url",
+        "registration_url",
+        "registration_deadline",
+        "event_starts",
+        "event_ends",
+        "event_timezone",
+        "format",
+        "eligibility_summary",
+    }
+    expected_values = {
+        "title": {"title": "Structured event"},
+        "description": {"description": "Event details"},
+        "official_url": {"official_url": "https://official.example.test/event"},
+        "registration_url": {"registration_url": "https://official.example.test/register"},
+        "registration_deadline": {"registration_deadline": {"on": "2027-06-10"}},
+        "event_starts": {"event_starts": {"at": "2027-06-11T09:30:00+00:00"}},
+        "event_ends": {"event_ends": {"on": "2027-06-13"}},
+        "event_timezone": {"event_timezone": "Asia/Kolkata"},
+        "format": {"format": "hybrid"},
+        "eligibility_summary": {"eligibility_summary": "Open to students"},
+    }
+    expected_excerpts = {
+        "title": "Structured event",
+        "description": "Description excerpt",
+        "official_url": "Official excerpt",
+        "registration_url": "Registration excerpt",
+        "registration_deadline": "Deadline excerpt",
+        "event_starts": "Start excerpt",
+        "event_ends": "End excerpt",
+        "event_timezone": "Timezone excerpt",
+        "format": "Format excerpt",
+        "eligibility_summary": "Eligibility excerpt",
+    }
+    for field_name, row in by_field.items():
+        assert row.competition_id == competition.id
+        assert row.source_id == source.id
+        assert row.field_key == ""
+        assert row.observed_value == expected_values[field_name]
+        assert row.evidence_excerpt == expected_excerpts[field_name]
+        assert row.review_state == "candidate"
+
+
+def test_observations_outside_registry_field_scope_are_reported_and_not_persisted(
+    db_session, monkeypatch
+):
+    source_url = "https://events.example.test/2027/scoped-observations"
+
+    def authorize(source_id, operation):
+        assert source_id == "synthetic-test-source:Scoped Events"
+        assert operation in {"store", "internal_review"}
+        return SimpleNamespace(
+            id=source_id,
+            publisher_name="Scoped Events",
+            source_kind="aggregator",
+            access={"allowed_hosts": ["example.test"]},
+            use={"fields": ["title", "description"]},
+        )
+
+    monkeypatch.setattr(persistence, "authorize_source_operation", authorize)
+    summary = persist_candidates(
+        db_session,
+        [
+            DiscoveryCandidate(
+                "Scoped event",
+                source_url,
+                "Scoped Events",
+                description=TextObservation("Allowed description"),
+                format=FormatObservation("online"),
+            )
+        ],
+        {"example.test"},
+    )
+
+    assert summary.discovered == 1
+    assert summary.skipped == 1
+    assert summary.skipped_fields == ("format",)
+    source = db_session.scalar(
+        select(CompetitionSource).where(CompetitionSource.normalized_url == source_url)
+    )
+    assert source is not None
+    evidence = db_session.scalars(
+        select(FieldEvidence).where(FieldEvidence.source_id == source.id)
+    ).all()
+    assert {row.field_name for row in evidence} == {"title", "description"}
 
 
 def test_accepting_imported_title_evidence_does_not_publish_competition(db_session):

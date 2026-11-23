@@ -7,7 +7,15 @@ from hashlib import sha256
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.discovery.candidates import DiscoveryCandidate
+from app.discovery.candidates import (
+    DateObservationField,
+    DateOnlyObservation,
+    DateTimeObservation,
+    DiscoveryCandidate,
+    FormatObservation,
+    TextObservation,
+    UrlObservation,
+)
 from app.discovery.registry import RegistryError, authorize_source_operation
 from app.discovery.urls import UnsafeSourceUrl, normalize_source_url
 from app.models import Competition, CompetitionSource, FieldEvidence, SourcePublisher
@@ -35,10 +43,61 @@ def _acquire_source_url_lock(session: Session, normalized_url: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class DiscoverySummary:
+    """Persistence totals; skipped counts field observations outside registry scope."""
+
     discovered: int = 0
     skipped: int = 0
     existing: int = 0
     failed: int = 0
+    skipped_fields: tuple[str, ...] = ()
+
+
+_STRUCTURED_OBSERVATION_FIELDS = (
+    "description",
+    "official_url",
+    "registration_url",
+    "registration_deadline",
+    "event_starts",
+    "event_ends",
+    "event_timezone",
+    "format",
+    "eligibility_summary",
+)
+
+
+def _candidate_evidence_specs(
+    candidate: DiscoveryCandidate, permitted_fields: set[str]
+) -> tuple[list[tuple[str, dict, str | None]], tuple[str, ...]]:
+    """Serialize candidate values to review evidence without changing canonical data."""
+    title = candidate.title.strip()
+    title_value = {"title": title}
+    if candidate.external_id:
+        title_value["source_external_id"] = candidate.external_id
+    specs: list[tuple[str, dict, str | None]] = [("title", title_value, title)]
+    skipped_fields: list[str] = []
+
+    for field_name in _STRUCTURED_OBSERVATION_FIELDS:
+        observation = getattr(candidate, field_name)
+        if observation is None:
+            continue
+        if field_name not in permitted_fields:
+            skipped_fields.append(field_name)
+            continue
+
+        if isinstance(observation, (TextObservation, UrlObservation, FormatObservation)):
+            value = observation.value
+        elif isinstance(observation, DateObservationField):
+            if isinstance(observation.value, DateOnlyObservation):
+                value = {"on": observation.value.on.isoformat()}
+            elif isinstance(observation.value, DateTimeObservation):
+                value = {"at": observation.value.at.isoformat()}
+            else:  # Defensive against invalid runtime objects despite dataclass validation.
+                raise TypeError(f"unsupported date observation for {field_name}")
+        else:  # Defensive against invalid runtime objects despite dataclass validation.
+            raise TypeError(f"unsupported observation for {field_name}")
+        specs.append((field_name, {field_name: value}, observation.excerpt))
+
+    return specs, tuple(skipped_fields)
 
 
 def persist_candidates(
@@ -94,15 +153,29 @@ def persist_candidates(
     if not candidate_list:
         return DiscoverySummary()
 
+    permitted_fields = set(store_source.use.get("fields", ()))
+    if "title" not in permitted_fields:
+        raise RegistryError(
+            "trusted registry source field scope does not permit required title evidence"
+        )
+
+    prepared_candidates = []
+    for candidate in candidate_list:
+        evidence_specs, skipped_fields = _candidate_evidence_specs(candidate, permitted_fields)
+        prepared_candidates.append((candidate, evidence_specs, skipped_fields))
+
     if session.get_bind().dialect.name != "postgresql":
         raise RuntimeError(
             "Discovery persistence requires PostgreSQL transaction-scoped advisory locks"
         )
 
-    discovered = existing = failed = 0
+    discovered = existing = failed = skipped = 0
+    skipped_fields: set[str] = set()
     transaction = nullcontext() if session.in_transaction() else session.begin()
     with transaction:
-        for candidate_index, candidate in enumerate(candidate_list, start=1):
+        for candidate_index, (candidate, evidence_specs, candidate_skipped_fields) in enumerate(
+            prepared_candidates, start=1
+        ):
             try:
                 normalized = normalize_source_url(candidate.source_url, allowed_hosts)
                 # Acquire before the global lookup and outside the candidate savepoint,
@@ -147,21 +220,24 @@ def persist_candidates(
                     )
                     session.add(source)
                     session.flush()
-                    observed_value = {"title": candidate.title.strip()}
-                    if candidate.external_id:
-                        observed_value["source_external_id"] = candidate.external_id
-                    session.add(
-                        FieldEvidence(
-                            competition_id=competition.id,
-                            source_id=source.id,
-                            field_name="title",
-                            observed_value=observed_value,
-                            evidence_excerpt=candidate.title.strip(),
-                            review_state="candidate",
-                        )
+                    session.add_all(
+                        [
+                            FieldEvidence(
+                                competition_id=competition.id,
+                                source_id=source.id,
+                                field_name=field_name,
+                                field_key="",
+                                observed_value=observed_value,
+                                evidence_excerpt=evidence_excerpt,
+                                review_state="candidate",
+                            )
+                            for field_name, observed_value, evidence_excerpt in evidence_specs
+                        ]
                     )
                     session.flush()
                     discovered += 1
+                    skipped += len(candidate_skipped_fields)
+                    skipped_fields.update(candidate_skipped_fields)
             except Exception as exc:
                 failed += 1
                 logger.warning(
@@ -169,4 +245,10 @@ def persist_candidates(
                     candidate_index,
                     type(exc).__name__,
                 )
-    return DiscoverySummary(discovered=discovered, existing=existing, failed=failed)
+    return DiscoverySummary(
+        discovered=discovered,
+        skipped=skipped,
+        existing=existing,
+        failed=failed,
+        skipped_fields=tuple(sorted(skipped_fields)),
+    )

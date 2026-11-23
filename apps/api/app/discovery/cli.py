@@ -113,6 +113,8 @@ def main() -> int:
     result = {
         "discovered": summary.discovered,
         "skipped": source_skipped,
+        "skipped_observations": summary.skipped,
+        "skipped_fields": list(summary.skipped_fields),
         "existing": summary.existing,
         "failed": summary.failed,
     }
