@@ -153,6 +153,7 @@ def test_repeat_source_urls_are_idempotent(db_session):
         select(CompetitionSource).where(CompetitionSource.normalized_url == url)
     )
     assert source is not None
+    assert source.registry_source_id == "synthetic-test-source:Example Events"
     assert evidence.competition_id == source.competition_id
     assert evidence.source_id == source.id
 
@@ -592,6 +593,322 @@ def test_existing_source_url_on_another_competition_is_not_duplicated(db_session
         )
         == source_count_before
     )
+    existing_source = db_session.scalar(
+        select(CompetitionSource).where(
+            CompetitionSource.normalized_url == "https://events.example.test/2027/existing"
+        )
+    )
+    assert existing_source is not None
+    assert existing_source.registry_source_id is None
+
+
+def test_existing_source_with_conflicting_registry_identity_is_not_reused(db_session):
+    competition = Competition(title="Existing trusted event")
+    db_session.add(competition)
+    db_session.flush()
+    source_url = "https://events.example.test/2027/conflicting-source"
+    existing_source = CompetitionSource(
+        competition_id=competition.id,
+        source_kind="aggregator",
+        source_url=source_url,
+        normalized_url=source_url,
+        registry_source_id="different-trusted-source",
+    )
+    db_session.add(existing_source)
+    db_session.flush()
+
+    summary = persist_candidates(
+        db_session,
+        [DiscoveryCandidate("Repeated event", source_url, "Example Events")],
+        {"example.test"},
+    )
+
+    assert summary.failed == 1
+    assert summary.existing == 0
+    assert summary.discovered == 0
+    db_session.refresh(existing_source)
+    assert existing_source.registry_source_id == "different-trusted-source"
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == source_url)
+    ) == 1
+
+
+def _add_existing_source(db_session, source_url, registry_source_id):
+    competition = Competition(title="Existing source record")
+    db_session.add(competition)
+    db_session.flush()
+    source = CompetitionSource(
+        competition_id=competition.id,
+        source_kind="aggregator",
+        source_url=source_url,
+        normalized_url=source_url,
+        registry_source_id=registry_source_id,
+    )
+    db_session.add(source)
+    db_session.flush()
+    return competition, source
+
+
+def test_all_matching_source_rows_are_deduplicated(db_session):
+    source_url = f"https://events.example.test/2027/matching-rows-{uuid4().hex}"
+    trusted_id = "synthetic-test-source:Example Events"
+    _, first = _add_existing_source(db_session, source_url, trusted_id)
+    _, second = _add_existing_source(db_session, source_url, trusted_id)
+    counts_before = (
+        db_session.scalar(select(func.count()).select_from(Competition)),
+        db_session.scalar(select(func.count()).select_from(CompetitionSource)),
+        db_session.scalar(select(func.count()).select_from(FieldEvidence)),
+    )
+
+    summary = persist_candidates(
+        db_session,
+        [DiscoveryCandidate("Repeated event", source_url, "Example Events")],
+        {"example.test"},
+    )
+
+    assert (summary.existing, summary.failed, summary.discovered) == (1, 0, 0)
+    assert first.registry_source_id == second.registry_source_id == trusted_id
+    assert (
+        db_session.scalar(select(func.count()).select_from(Competition)),
+        db_session.scalar(select(func.count()).select_from(CompetitionSource)),
+        db_session.scalar(select(func.count()).select_from(FieldEvidence)),
+    ) == counts_before
+
+
+def test_matching_and_null_source_rows_are_deduplicated_without_backfill(db_session):
+    source_url = f"https://events.example.test/2027/mixed-null-rows-{uuid4().hex}"
+    trusted_id = "synthetic-test-source:Example Events"
+    _, matching = _add_existing_source(db_session, source_url, trusted_id)
+    _, legacy_null = _add_existing_source(db_session, source_url, None)
+
+    summary = persist_candidates(
+        db_session,
+        [DiscoveryCandidate("Repeated event", source_url, "Example Events")],
+        {"example.test"},
+    )
+
+    assert (summary.existing, summary.failed, summary.discovered) == (1, 0, 0)
+    db_session.refresh(matching)
+    db_session.refresh(legacy_null)
+    assert matching.registry_source_id == trusted_id
+    assert legacy_null.registry_source_id is None
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == source_url)
+    ) == 2
+
+
+def test_conflict_in_later_matching_url_row_fails_candidate_without_writes(db_session):
+    source_url = f"https://events.example.test/2027/later-conflict-{uuid4().hex}"
+    trusted_id = "synthetic-test-source:Example Events"
+    _, matching_first = _add_existing_source(db_session, source_url, trusted_id)
+    _, conflicting_second = _add_existing_source(
+        db_session, source_url, "different-trusted-source"
+    )
+    competition_count_before = db_session.scalar(
+        select(func.count()).select_from(Competition)
+    )
+    source_count_before = db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == source_url)
+    )
+
+    summary = persist_candidates(
+        db_session,
+        [DiscoveryCandidate("Repeated event", source_url, "Example Events")],
+        {"example.test"},
+    )
+
+    assert (summary.existing, summary.failed, summary.discovered) == (0, 1, 0)
+    db_session.refresh(matching_first)
+    db_session.refresh(conflicting_second)
+    assert matching_first.registry_source_id == trusted_id
+    assert conflicting_second.registry_source_id == "different-trusted-source"
+    assert db_session.scalar(select(func.count()).select_from(Competition)) == (
+        competition_count_before
+    )
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == source_url)
+    ) == source_count_before
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(FieldEvidence)
+        .where(
+            FieldEvidence.source_id.in_(
+                select(CompetitionSource.id).where(
+                    CompetitionSource.normalized_url == source_url
+                )
+            )
+        )
+    ) == 0
+
+
+def test_conflicting_candidate_does_not_prevent_later_batch_candidate(db_session):
+    conflict_url = f"https://events.example.test/2027/batch-conflict-{uuid4().hex}"
+    success_url = f"https://events.example.test/2027/batch-success-{uuid4().hex}"
+    _add_existing_source(db_session, conflict_url, "different-trusted-source")
+
+    summary = persist_candidates(
+        db_session,
+        [
+            DiscoveryCandidate("Conflicting event", conflict_url, "Example Events"),
+            DiscoveryCandidate("Independent event", success_url, "Example Events"),
+        ],
+        {"example.test"},
+    )
+
+    assert (summary.failed, summary.discovered, summary.existing) == (1, 1, 0)
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == conflict_url)
+    ) == 1
+    successful_source = db_session.scalar(
+        select(CompetitionSource).where(CompetitionSource.normalized_url == success_url)
+    )
+    assert successful_source is not None
+    assert successful_source.registry_source_id == "synthetic-test-source:Example Events"
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(FieldEvidence)
+        .where(FieldEvidence.source_id == successful_source.id)
+    ) == 1
+
+
+def test_concurrent_same_url_different_registry_id_fails_second_candidate(
+    monkeypatch,
+):
+    source_url = f"https://events.example.test/2027/identity-race-{uuid4().hex}"
+    first_publisher = f"Concurrent source A {uuid4().hex}"
+    second_publisher = f"Concurrent source B {uuid4().hex}"
+    first_registry_id = f"synthetic-test-source:{first_publisher}"
+    second_registry_id = f"synthetic-test-source:{second_publisher}"
+    first_candidate = DiscoveryCandidate("First event", source_url, first_publisher)
+    second_candidate = DiscoveryCandidate("Second event", source_url, second_publisher)
+    second_backend_ready = Event()
+    second_lock_acquired = Event()
+    capture_second_backend = Event()
+    second_backend_pid = []
+    original_acquire_lock = persistence._acquire_source_url_lock
+
+    def observe_lock_attempt(session, normalized_url):
+        is_second_attempt = capture_second_backend.is_set() and normalized_url == source_url
+        if is_second_attempt:
+            second_backend_pid.append(
+                session.connection().exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
+            )
+            second_backend_ready.set()
+        original_acquire_lock(session, normalized_url)
+        if is_second_attempt:
+            second_lock_acquired.set()
+
+    monkeypatch.setattr(persistence, "_acquire_source_url_lock", observe_lock_attempt)
+    caller_session = SessionLocal()
+    caller_transaction = caller_session.begin()
+    executor = ThreadPoolExecutor(max_workers=1)
+    worker_future = None
+    try:
+        first_summary = _persist_candidates(
+            caller_session,
+            [first_candidate],
+            {"example.test"},
+            registry_source_id=first_registry_id,
+        )
+        assert (first_summary.discovered, first_summary.failed) == (1, 0)
+
+        def persist_with_second_identity():
+            with SessionLocal() as worker_session:
+                worker_session.execute(text("SET LOCAL lock_timeout = '10s'"))
+                return _persist_candidates(
+                    worker_session,
+                    [second_candidate],
+                    {"example.test"},
+                    registry_source_id=second_registry_id,
+                )
+
+        capture_second_backend.set()
+        worker_future = executor.submit(persist_with_second_identity)
+        assert second_backend_ready.wait(timeout=10)
+
+        wait_deadline = monotonic() + 10
+        observed_advisory_wait = False
+        while monotonic() < wait_deadline:
+            with engine.connect() as observer_connection:
+                wait_state = observer_connection.execute(
+                    text(
+                        "SELECT wait_event_type, wait_event "
+                        "FROM pg_stat_activity WHERE pid = :backend_pid"
+                    ),
+                    {"backend_pid": second_backend_pid[0]},
+                ).one_or_none()
+            if wait_state == ("Lock", "advisory"):
+                observed_advisory_wait = True
+                break
+            if second_lock_acquired.is_set() or worker_future.done():
+                break
+            sleep(0.05)
+        assert observed_advisory_wait, "second backend did not wait on the URL advisory lock"
+
+        caller_transaction.commit()
+        second_summary = worker_future.result(timeout=12)
+
+        assert second_lock_acquired.is_set()
+        assert (second_summary.discovered, second_summary.existing, second_summary.failed) == (
+            0,
+            0,
+            1,
+        )
+        with SessionLocal() as verification_session:
+            sources = verification_session.scalars(
+                select(CompetitionSource).where(
+                    CompetitionSource.normalized_url == source_url
+                )
+            ).all()
+            evidence_count = verification_session.scalar(
+                select(func.count())
+                .select_from(FieldEvidence)
+                .where(FieldEvidence.source_id.in_(select(CompetitionSource.id).where(
+                    CompetitionSource.normalized_url == source_url
+                )))
+            )
+        assert len(sources) == 1
+        assert sources[0].registry_source_id == first_registry_id
+        assert evidence_count == 1
+    finally:
+        if caller_transaction.is_active:
+            caller_transaction.rollback()
+        if worker_future is not None:
+            try:
+                worker_future.result(timeout=12)
+            except Exception:
+                pass
+        executor.shutdown(wait=True, cancel_futures=True)
+        caller_session.close()
+
+        with SessionLocal.begin() as cleanup_session:
+            matching_competitions = select(CompetitionSource.competition_id).where(
+                CompetitionSource.normalized_url == source_url
+            )
+            cleanup_session.execute(
+                delete(Competition).where(Competition.id.in_(matching_competitions))
+            )
+            publisher_has_sources = exists(
+                select(CompetitionSource.id).where(
+                    CompetitionSource.publisher_id == SourcePublisher.id
+                )
+            )
+            cleanup_session.execute(
+                delete(SourcePublisher).where(
+                    SourcePublisher.name.in_([first_publisher, second_publisher]),
+                    ~publisher_has_sources,
+                )
+            )
 
 
 def test_caller_rollback_removes_persisted_discovery(db_session):

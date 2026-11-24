@@ -41,6 +41,19 @@ def _acquire_source_url_lock(session: Session, normalized_url: str) -> None:
     session.connection().execute(select(func.pg_advisory_xact_lock(lock_key)))
 
 
+def _validate_existing_source_identity(
+    source: CompetitionSource, trusted_registry_source_id: str
+) -> None:
+    """Reject a deduplicated URL already bound to a different trusted source."""
+    if (
+        source.registry_source_id is not None
+        and source.registry_source_id != trusted_registry_source_id
+    ):
+        raise RegistryError(
+            "existing source URL is associated with a different registry source identity"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class DiscoverySummary:
     """Persistence totals; skipped counts field observations outside registry scope."""
@@ -183,12 +196,17 @@ def persist_candidates(
                 # caller's transaction finishes.
                 _acquire_source_url_lock(session, normalized)
                 with session.begin_nested():
-                    seen = session.scalar(
-                        select(CompetitionSource.id).where(
-                            CompetitionSource.normalized_url == normalized
-                        ).limit(1)
-                    )
-                    if seen is not None:
+                    existing_sources = session.scalars(
+                        select(CompetitionSource)
+                        .where(CompetitionSource.normalized_url == normalized)
+                        .order_by(CompetitionSource.id)
+                        .with_for_update()
+                    ).all()
+                    if existing_sources:
+                        for existing_source in existing_sources:
+                            _validate_existing_source_identity(
+                                existing_source, registry_source_id
+                            )
                         existing += 1
                         continue
 
@@ -217,6 +235,7 @@ def persist_candidates(
                         source_kind=candidate.source_kind,
                         source_url=candidate.source_url,
                         normalized_url=normalized,
+                        registry_source_id=registry_source_id,
                     )
                     session.add(source)
                     session.flush()

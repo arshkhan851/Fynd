@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.discovery import DiscoveryCandidate, persistence
-from app.discovery.persistence import DiscoverySummary, persist_candidates
+from app.discovery.persistence import (
+    DiscoverySummary,
+    _validate_existing_source_identity,
+    persist_candidates,
+)
 from app.discovery.registry import RegistryError
 
 SOURCE_ID = "synthetic-source"
@@ -146,6 +150,24 @@ def test_candidate_publisher_cannot_forge_trusted_source_identity():
             publisher_name=PUBLISHER,
             registry_source_id=SOURCE_ID,
         )
+
+
+@pytest.mark.parametrize("existing_identity", [None, SOURCE_ID])
+def test_deduplicated_source_with_null_or_matching_identity_is_not_rebound(existing_identity):
+    source = SimpleNamespace(registry_source_id=existing_identity)
+
+    _validate_existing_source_identity(source, SOURCE_ID)
+
+    assert source.registry_source_id is existing_identity
+
+
+def test_deduplicated_source_with_conflicting_identity_is_rejected():
+    source = SimpleNamespace(registry_source_id="another-source")
+
+    with pytest.raises(RegistryError, match="different registry source identity"):
+        _validate_existing_source_identity(source, SOURCE_ID)
+
+    assert source.registry_source_id == "another-source"
 
 
 def test_registry_host_restriction_rejects_candidate_before_database_access(monkeypatch):

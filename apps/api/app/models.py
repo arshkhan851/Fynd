@@ -611,6 +611,7 @@ class CompetitionSource(Base):
         Index("ix_competition_sources_competition_id", "competition_id"),
         Index("ix_competition_sources_organizer_submission_id", "organizer_submission_id"),
         Index("ix_competition_sources_last_checked_at", "last_checked_at"),
+        Index("ix_competition_sources_registry_source_id", "registry_source_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
@@ -623,6 +624,7 @@ class CompetitionSource(Base):
     publisher_id: Mapped[int | None] = mapped_column(
         ForeignKey("source_publishers.id", ondelete="SET NULL")
     )
+    registry_source_id: Mapped[str | None] = mapped_column(Text)
     source_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     source_url: Mapped[str | None] = mapped_column(Text)
     normalized_url: Mapped[str | None] = mapped_column(Text)
@@ -722,6 +724,35 @@ class FieldEvidence(Base):
     )
 
     source: Mapped[CompetitionSource] = relationship(back_populates="evidence")
+
+
+class EvidenceReviewEvent(Base):
+    __tablename__ = "evidence_review_events"
+    __table_args__ = (
+        CheckConstraint(
+            "(action = 'accepted' AND previous_state = 'candidate' AND new_state = 'selected') "
+            "OR (action = 'rejected' AND previous_state = 'candidate' AND new_state = 'rejected') "
+            "OR (action = 'superseded' AND previous_state = 'selected' "
+            "AND new_state = 'superseded')",
+            name="ck_evidence_review_events_transition",
+        ),
+        Index("ix_evidence_review_events_evidence_created", "evidence_id", "created_at"),
+        Index("ix_evidence_review_events_reviewer_created", "reviewer_user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    evidence_id: Mapped[int] = mapped_column(
+        ForeignKey("field_evidence.id", ondelete="RESTRICT"), nullable=False
+    )
+    reviewer_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    previous_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    new_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class DuplicateCandidate(Base):
