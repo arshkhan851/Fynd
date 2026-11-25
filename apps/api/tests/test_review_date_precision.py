@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.review.service import ReviewError, accept_evidence
+from app.review.service import ReviewError, _apply_accepted_evidence
 
 
 class _NoSelectedEvidence:
@@ -32,6 +32,9 @@ class _ReviewSession:
     def flush(self):
         self.flush_count += 1
 
+    def add(self, _item):
+        pass
+
 
 def _competition(*, starts_on=None, starts_at=None, ends_on=None, ends_at=None):
     return SimpleNamespace(
@@ -56,7 +59,9 @@ def _evidence(field_name, value):
 
 def _accept(evidence, competition):
     session = _ReviewSession(evidence, competition)
-    result = accept_evidence(session, evidence.id, commit=False)
+    reviewer = SimpleNamespace(id="reviewer-id")
+    _apply_accepted_evidence(session, evidence, competition, reviewer)
+    result = evidence
     return result, session
 
 
@@ -134,7 +139,9 @@ def test_rejects_mixed_precision_in_either_acceptance_order(
     session = _ReviewSession(evidence, competition)
 
     with pytest.raises(ReviewError, match="mixed-precision event range requires human resolution"):
-        accept_evidence(session, evidence.id, commit=False)
+        _apply_accepted_evidence(
+            session, evidence, competition, SimpleNamespace(id="reviewer-id")
+        )
 
     assert (
         competition.event_starts_on,

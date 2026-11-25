@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 guard_isolated_postgres_integration_tests()
 
+from app.auth.models import User  # noqa: E402
 from app.database import SessionLocal, engine  # noqa: E402
 from app.discovery import DiscoveryCandidate, persistence  # noqa: E402
 from app.discovery import persist_candidates as _persist_candidates  # noqa: E402
@@ -30,6 +31,7 @@ from app.models import (  # noqa: E402
     FieldEvidence,
     SourcePublisher,
 )
+from app.review import service as review_service  # noqa: E402
 from app.review.service import accept_evidence  # noqa: E402
 
 
@@ -41,6 +43,10 @@ def db_session():
         pytest.skip("PostgreSQL is unavailable for discovery persistence tests")
     transaction = connection.begin()
     session = Session(bind=connection)
+    reviewer = User(email=f"discovery-reviewer-{uuid4().hex}@example.test")
+    session.add(reviewer)
+    session.flush()
+    session.info["reviewer"] = reviewer
     try:
         yield session
     finally:
@@ -80,6 +86,7 @@ def synthetic_source_authorization(monkeypatch):
         )
 
     monkeypatch.setattr(persistence, "authorize_source_operation", authorize)
+    monkeypatch.setattr(review_service, "authorize_source_operation", authorize)
 
 
 def persist_candidates(session, candidates, allowed_hosts):
@@ -345,7 +352,12 @@ def test_accepting_imported_title_evidence_does_not_publish_competition(db_sessi
     assert competition is not None
     assert competition.is_published is False
 
-    accept_evidence(db_session, evidence.id, commit=False)
+    accept_evidence(
+        db_session,
+        evidence.id,
+        reviewer=db_session.info["reviewer"],
+        commit=False,
+    )
 
     db_session.refresh(competition)
     assert competition.title == "Reviewed imported event"

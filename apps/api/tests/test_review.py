@@ -1,15 +1,18 @@
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from integration_database_guard import guard_isolated_postgres_integration_tests
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 guard_isolated_postgres_integration_tests()
 
+from app.auth.models import User  # noqa: E402
 from app.database import engine  # noqa: E402
 from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS  # noqa: E402
 from app.models import (  # noqa: E402
@@ -17,22 +20,35 @@ from app.models import (  # noqa: E402
     Competition,
     CompetitionCategory,
     CompetitionSource,
+    EvidenceReviewEvent,
     FieldEvidence,
     SourcePublisher,
 )
 from app.review import (  # noqa: E402
     ReviewError,
     UnsupportedEvidenceField,
-    accept_evidence,
     create_category_proposal,
     get_competition_detail,
     list_pending_evidence,
-    reject_evidence,
     unassign_category,
 )
 from app.review import service as review_service  # noqa: E402
+from app.review.service import accept_evidence as _accept_evidence  # noqa: E402
+from app.review.service import reject_evidence as _reject_evidence  # noqa: E402
 
 pytestmark = pytest.mark.integration
+
+
+def accept_evidence(session, evidence_id, *, commit=True, reviewer=None):
+    reviewer = reviewer or session.info["reviewer"]
+    return _accept_evidence(
+        session, evidence_id, reviewer=reviewer, commit=commit
+    )
+
+
+def reject_evidence(session, evidence_id, *, reviewer=None):
+    reviewer = reviewer or session.info["reviewer"]
+    return _reject_evidence(session, evidence_id, reviewer=reviewer)
 
 
 def test_review_acceptance_paths_match_shared_evidence_vocabulary():
@@ -54,10 +70,22 @@ def review_database_available():
 
 
 @pytest.fixture
-def db_session(review_database_available):
+def db_session(review_database_available, monkeypatch):
     connection = engine.connect()
     transaction = connection.begin()
     session = Session(bind=connection)
+    reviewer = User(email=f"reviewer-{uuid4().hex}@example.test")
+    session.add(reviewer)
+    session.flush()
+    session.info["reviewer"] = reviewer
+    monkeypatch.setattr(
+        review_service,
+        "authorize_source_operation",
+        lambda source_id, _operation: SimpleNamespace(
+            id=source_id,
+            access={"allowed_hosts": ["review.example.test"]},
+        ),
+    )
     try:
         yield session
     finally:
@@ -85,6 +113,7 @@ def _add_source_and_evidence(
         source_kind="official",
         source_url=f"https://review.example.test/{suffix}",
         normalized_url=f"https://review.example.test/{suffix}",
+        registry_source_id="test-review-source",
     )
     session.add(source)
     session.flush()
@@ -222,9 +251,7 @@ def test_accepting_replacement_supersedes_prior_selection_and_keeps_both(db_sess
     ) == 2
 
 
-def test_scalar_evidence_rejects_non_empty_key_without_changing_value_or_selection(
-    db_session, monkeypatch
-):
+def test_scalar_evidence_rejects_non_empty_key_without_changing_value_or_selection(db_session):
     competition = Competition(title="Selected title")
     db_session.add(competition)
     db_session.flush()
@@ -246,12 +273,13 @@ def test_scalar_evidence_rejects_non_empty_key_without_changing_value_or_selecti
         review_state="candidate",
     )
 
-    # Simulate a malformed historical row returned by the evidence lookup. The
-    # current PostgreSQL CHECK correctly prevents inserting such a row now.
-    with monkeypatch.context() as patch:
-        patch.setattr(db_session, "scalar", lambda _statement: candidate)
-        with pytest.raises(ReviewError, match="must have an empty field_key"):
-            accept_evidence(db_session, candidate.id)
+    # PostgreSQL rejects this malformed historical shape on insert, so exercise
+    # the shared pre-mutation acceptance helper directly without mocking session
+    # lookup behavior.
+    with pytest.raises(ReviewError, match="must have an empty field_key"):
+        review_service._apply_accepted_evidence(
+            db_session, candidate, competition, db_session.info["reviewer"]
+        )
 
     db_session.refresh(competition)
     db_session.refresh(selected)
@@ -623,12 +651,135 @@ def test_unassigning_category_removes_link_and_supersedes_approval(db_session):
     competition, category, source = _add_category_and_source(db_session)
     proposal = create_category_proposal(db_session, competition.id, category.slug, source.id)
     accept_evidence(db_session, proposal.id)
+    reviewer = db_session.info["reviewer"]
 
-    unassign_category(db_session, competition.id, category.slug)
+    unassign_category(db_session, competition.id, category.slug, reviewer=reviewer)
 
     db_session.refresh(proposal)
     assert db_session.get(CompetitionCategory, (competition.id, category.id)) is None
     assert proposal.review_state == "superseded"
+    events = db_session.scalars(
+        select(EvidenceReviewEvent)
+        .where(EvidenceReviewEvent.evidence_id == proposal.id)
+        .order_by(EvidenceReviewEvent.action, EvidenceReviewEvent.id)
+    ).all()
+    assert [
+        (
+            event.evidence_id,
+            event.reviewer_user_id,
+            event.action,
+            event.previous_state,
+            event.new_state,
+        )
+        for event in events
+    ] == [
+        (proposal.id, reviewer.id, "accepted", "candidate", "selected"),
+        (proposal.id, reviewer.id, "superseded", "selected", "superseded"),
+    ]
+    with pytest.raises(ReviewError, match="is not assigned"):
+        unassign_category(db_session, competition.id, category.slug, reviewer=reviewer)
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(EvidenceReviewEvent)
+        .where(EvidenceReviewEvent.evidence_id == proposal.id)
+    ) == 2
+
+
+@pytest.mark.parametrize("reviewer_state", ["missing", "nonexistent", "inactive"])
+def test_unassign_category_requires_active_persisted_reviewer(db_session, reviewer_state):
+    competition, category, source = _add_category_and_source(db_session)
+    proposal = create_category_proposal(db_session, competition.id, category.slug, source.id)
+    reviewer = db_session.info["reviewer"]
+    accept_evidence(db_session, proposal.id)
+
+    if reviewer_state == "missing":
+        supplied_reviewer = None
+    elif reviewer_state == "nonexistent":
+        supplied_reviewer = User(id=uuid4(), email=f"missing-{uuid4().hex}@example.test")
+    else:
+        reviewer.is_active = False
+        db_session.flush()
+        supplied_reviewer = reviewer
+
+    with pytest.raises(ReviewError, match="reviewer"):
+        unassign_category(
+            db_session,
+            competition.id,
+            category.slug,
+            reviewer=supplied_reviewer,
+        )
+
+    db_session.refresh(proposal)
+    assert db_session.get(CompetitionCategory, (competition.id, category.id)) is not None
+    assert proposal.review_state == "selected"
+    events = db_session.scalars(
+        select(EvidenceReviewEvent).where(EvidenceReviewEvent.evidence_id == proposal.id)
+    ).all()
+    assert [(item.action, item.previous_state, item.new_state) for item in events] == [
+        ("accepted", "candidate", "selected")
+    ]
+
+
+def test_failed_category_unassignment_preserves_link_state_and_audit(db_session):
+    competition, category, source = _add_category_and_source(db_session)
+    proposal = create_category_proposal(db_session, competition.id, category.slug, source.id)
+    accept_evidence(db_session, proposal.id)
+    reviewer = db_session.info["reviewer"]
+    unassigned_category = Category(
+        name=f"Unassigned test category {uuid4().hex}",
+        slug=f"unassigned-test-{uuid4().hex}",
+    )
+    db_session.add(unassigned_category)
+    db_session.flush()
+
+    with pytest.raises(ReviewError, match="is not assigned"):
+        unassign_category(
+            db_session,
+            competition.id,
+            unassigned_category.slug,
+            reviewer=reviewer,
+        )
+
+    db_session.refresh(proposal)
+    assert db_session.get(CompetitionCategory, (competition.id, category.id)) is not None
+    assert proposal.review_state == "selected"
+    events = db_session.scalars(
+        select(EvidenceReviewEvent).where(EvidenceReviewEvent.evidence_id == proposal.id)
+    ).all()
+    assert [(item.action, item.previous_state, item.new_state) for item in events] == [
+        ("accepted", "candidate", "selected")
+    ]
+
+
+def test_audit_insert_failure_rolls_back_category_unassignment(db_session):
+    competition, category, source = _add_category_and_source(db_session)
+    proposal = create_category_proposal(db_session, competition.id, category.slug, source.id)
+    accept_evidence(db_session, proposal.id)
+    reviewer = db_session.info["reviewer"]
+
+    def fail_supersession_audit(session, _flush_context):
+        if any(
+            isinstance(item, EvidenceReviewEvent) and item.action == "superseded"
+            for item in session.new
+        ):
+            raise RuntimeError("simulated supersession audit insertion failure")
+
+    sqlalchemy_event.listen(db_session, "after_flush", fail_supersession_audit)
+    try:
+        with pytest.raises(RuntimeError, match="supersession audit insertion failure"):
+            unassign_category(db_session, competition.id, category.slug, reviewer=reviewer)
+    finally:
+        sqlalchemy_event.remove(db_session, "after_flush", fail_supersession_audit)
+
+    db_session.expire_all()
+    assert db_session.get(CompetitionCategory, (competition.id, category.id)) is not None
+    assert db_session.get(FieldEvidence, proposal.id).review_state == "selected"
+    events = db_session.scalars(
+        select(EvidenceReviewEvent).where(EvidenceReviewEvent.evidence_id == proposal.id)
+    ).all()
+    assert [(item.action, item.previous_state, item.new_state) for item in events] == [
+        ("accepted", "candidate", "selected")
+    ]
 
 
 def test_category_primary_uniqueness_is_respected(db_session):

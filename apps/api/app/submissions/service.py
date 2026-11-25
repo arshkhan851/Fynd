@@ -31,7 +31,7 @@ from app.models import (
     SubmissionConsent,
     SubmissionReviewEvent,
 )
-from app.review.service import ReviewError, accept_evidence
+from app.review.service import ReviewError, accept_submission_evidence
 from app.submissions.consent import (
     CURRENT_CONSENT_DECLARATION_TEXT,
     CURRENT_CONSENT_DECLARATION_VERSION,
@@ -783,9 +783,21 @@ def approve_submission(
                 evidence_rows.append(evidence)
             db.flush()
 
+            validated_evidence_specs = {
+                evidence.id: evidence_spec
+                for evidence, evidence_spec in zip(evidence_rows, evidence_specs, strict=True)
+            }
             for evidence in evidence_rows:
                 try:
-                    accept_evidence(db, evidence.id, commit=False)
+                    accept_submission_evidence(
+                        db,
+                        evidence.id,
+                        submission_id=submission.id,
+                        source_id=source.id,
+                        competition_id=competition.id,
+                        validated_evidence_specs=validated_evidence_specs,
+                        reviewer=persisted_reviewer,
+                    )
                 except ReviewError as exc:
                     raise SubmissionValidationError(
                         f"approval evidence could not be accepted: {exc}"

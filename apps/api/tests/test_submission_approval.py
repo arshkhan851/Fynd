@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from app.models import (
     CompetitionOrganizer,
     CompetitionPrize,
     CompetitionSource,
+    EvidenceReviewEvent,
     FieldEvidence,
     Organizer,
     OrganizerSubmission,
@@ -184,6 +186,122 @@ def _counts(db: Session) -> dict[str, int]:
         "competition_categories": db.scalar(select(func.count()).select_from(CompetitionCategory)),
         "prizes": db.scalar(select(func.count()).select_from(CompetitionPrize)),
         "review_events": db.scalar(select(func.count()).select_from(SubmissionReviewEvent)),
+        "evidence_review_events": db.scalar(
+            select(func.count()).select_from(EvidenceReviewEvent)
+        ),
+    }
+
+
+def _approval_state_snapshot(db: Session, submission_id: int) -> dict[str, object]:
+    def rows(model, order_by, *columns):
+        instances = db.scalars(select(model).order_by(*order_by)).all()
+        return tuple(
+            tuple(deepcopy(getattr(instance, column)) for column in columns)
+            for instance in instances
+        )
+
+    canonical_fields = (
+        "title",
+        "description",
+        "eligibility_summary",
+        "format",
+        "official_url",
+        "registration_url",
+        "registration_opens_at",
+        "registration_opens_on",
+        "registration_deadline_at",
+        "registration_deadline_on",
+        "event_starts_at",
+        "event_starts_on",
+        "event_ends_at",
+        "event_ends_on",
+        "event_timezone",
+        "is_published",
+    )
+    return {
+        "counts": _counts(db),
+        "submission": tuple(
+            getattr(db.get(OrganizerSubmission, submission_id), field)
+            for field in ("status", "approved_competition_id", "updated_at")
+        ),
+        "competitions": rows(
+            Competition,
+            (Competition.id,),
+            "id",
+            *canonical_fields,
+        ),
+        "sources": rows(
+            CompetitionSource,
+            (CompetitionSource.id,),
+            "id",
+            "competition_id",
+            "organizer_submission_id",
+            "source_kind",
+            "source_url",
+            "normalized_url",
+            "registry_source_id",
+        ),
+        "evidence": rows(
+            FieldEvidence,
+            (FieldEvidence.id,),
+            "id",
+            "competition_id",
+            "source_id",
+            "field_name",
+            "field_key",
+            "observed_value",
+            "review_state",
+            "reviewed_at",
+        ),
+        "competition_categories": rows(
+            CompetitionCategory,
+            (CompetitionCategory.competition_id, CompetitionCategory.category_id),
+            "competition_id",
+            "category_id",
+            "is_primary",
+        ),
+        "competition_organizers": rows(
+            CompetitionOrganizer,
+            (CompetitionOrganizer.competition_id, CompetitionOrganizer.organizer_id),
+            "competition_id",
+            "organizer_id",
+            "role",
+        ),
+        "organizers": rows(Organizer, (Organizer.id,), "id", "name"),
+        "consents": rows(
+            SubmissionConsent,
+            (SubmissionConsent.id,),
+            "id",
+            "submission_id",
+            "submitter_user_id",
+            "submitter_email_snapshot",
+            "declaration_version",
+            "declaration_text",
+            "declaration_sha256",
+            "accepted_at",
+        ),
+        "evidence_review_events": rows(
+            EvidenceReviewEvent,
+            (EvidenceReviewEvent.id,),
+            "id",
+            "evidence_id",
+            "reviewer_user_id",
+            "action",
+            "previous_state",
+            "new_state",
+            "created_at",
+        ),
+        "submission_review_events": rows(
+            SubmissionReviewEvent,
+            (SubmissionReviewEvent.id,),
+            "id",
+            "submission_id",
+            "reviewer_user_id",
+            "previous_status",
+            "new_status",
+            "note",
+            "created_at",
+        ),
     }
 
 
@@ -220,6 +338,8 @@ def test_approval_creates_evidence_relations_and_publishes_atomically(approval_d
     source = db.scalar(
         select(CompetitionSource).where(CompetitionSource.organizer_submission_id == submission_id)
     )
+    assert source.organizer_submission_id == submission_id
+    assert source.registry_source_id is None
     evidence = db.scalars(select(FieldEvidence).where(FieldEvidence.source_id == source.id)).all()
     assert {item.field_name for item in evidence} >= {
         "title",
@@ -233,6 +353,17 @@ def test_approval_creates_evidence_relations_and_publishes_atomically(approval_d
     }
     assert all(item.field_name in REVIEW_SUPPORTED_EVIDENCE_FIELDS for item in evidence)
     assert all(item.review_state == "selected" for item in evidence)
+    evidence_events = db.scalars(
+        select(EvidenceReviewEvent).where(
+            EvidenceReviewEvent.evidence_id.in_([item.id for item in evidence])
+        )
+    ).all()
+    assert len(evidence_events) == len(evidence)
+    assert all(
+        (item.action, item.previous_state, item.new_state, item.reviewer_user_id)
+        == ("accepted", "candidate", "selected", admin.id)
+        for item in evidence_events
+    )
     assert all(
         item.field_key == ("" if item.field_name != "category" else item.observed_value["slug"])
         for item in evidence
@@ -258,6 +389,96 @@ def test_approval_creates_evidence_relations_and_publishes_atomically(approval_d
     assert client.get(f"/competitions/{competition_id}").status_code == 200
     assert client.get("/competitions", params={"q": result["title"]}).json()["total"] == 1
     assert _counts(db)["competitions"] == before["competitions"] + 1
+
+
+def test_submission_acceptance_rejects_foreign_source_and_snapshot_evidence(
+    approval_db, client
+):
+    from app.review.service import accept_submission_evidence
+    from app.submissions import service
+
+    db = approval_db
+    submission_id, _ = _make_under_review(client, db, categories=False)
+    other_submission_id, _ = _make_under_review(
+        client, db, categories=False, email=f"other-{uuid4().hex}@example.org"
+    )
+    reviewer = _admin_login(client, db, f"provenance-check-{uuid4().hex}")
+    submission = db.get(OrganizerSubmission, submission_id)
+    other_submission = db.get(OrganizerSubmission, other_submission_id)
+    category_links, categories = service._validate_approval_snapshot(db, submission)
+    specs = service._approval_evidence_specs(submission, category_links, categories)
+    target_spec = next(spec for spec in specs if spec[0] == "title")
+    competition = Competition()
+    db.add(competition)
+    db.flush()
+    target_source = CompetitionSource(
+        competition_id=competition.id,
+        organizer_submission_id=submission.id,
+        source_kind="organizer",
+        source_url=submission.official_url,
+    )
+    foreign_source = CompetitionSource(
+        competition_id=competition.id,
+        organizer_submission_id=other_submission.id,
+        source_kind="organizer",
+        source_url=other_submission.official_url,
+    )
+    db.add_all([target_source, foreign_source])
+    db.flush()
+
+    def add_evidence(source, spec):
+        field_name, field_key, observed_value, excerpt = spec
+        row = FieldEvidence(
+            competition_id=competition.id,
+            source_id=source.id,
+            field_name=field_name,
+            field_key=field_key,
+            observed_value=observed_value,
+            evidence_excerpt=excerpt,
+        )
+        db.add(row)
+        db.flush()
+        return row
+
+    foreign_evidence = add_evidence(foreign_source, target_spec)
+    target_evidence = add_evidence(target_source, target_spec)
+
+    with pytest.raises(ReviewError, match="not linked to the locked submission"):
+        accept_submission_evidence(
+            db,
+            foreign_evidence.id,
+            submission_id=submission.id,
+            source_id=foreign_source.id,
+            competition_id=competition.id,
+            validated_evidence_specs={foreign_evidence.id: target_spec},
+            reviewer=reviewer,
+        )
+    with pytest.raises(ReviewError, match="not part of the validated submission snapshot"):
+        accept_submission_evidence(
+            db,
+            target_evidence.id,
+            submission_id=submission.id,
+            source_id=target_source.id,
+            competition_id=competition.id,
+            validated_evidence_specs={},
+            reviewer=reviewer,
+        )
+    with pytest.raises(ReviewError, match="outside the validated submission snapshot"):
+        accept_submission_evidence(
+            db,
+            target_evidence.id,
+            submission_id=submission.id,
+            source_id=target_source.id,
+            competition_id=competition.id,
+            validated_evidence_specs={
+                target_evidence.id: ("title", "", {"title": "forged"}, "forged")
+            },
+            reviewer=reviewer,
+        )
+    db.refresh(target_evidence)
+    db.refresh(foreign_evidence)
+    assert target_evidence.review_state == "candidate"
+    assert foreign_evidence.review_state == "candidate"
 
 
 def test_approval_can_use_explicit_existing_competition_and_organizer(approval_db, client):
@@ -318,7 +539,11 @@ def test_multiple_submissions_can_preserve_provenance_to_same_competition(approv
         submission_id, _ = _make_under_review(
             client, db, email=f"shared-{index}-{uuid4().hex}@example.org"
         )
-        _admin_login(client, db, f"shared-admin-{index}")
+        admin = _admin_login(client, db, f"shared-admin-{index}")
+        if index == 0:
+            first_reviewer_id = admin.id
+        else:
+            second_reviewer_id = admin.id
         response = client.post(
             f"/api/v1/admin/submissions/{submission_id}/approve",
             json={
@@ -337,6 +562,34 @@ def test_multiple_submissions_can_preserve_provenance_to_same_competition(approv
     ).all()
     assert {source.organizer_submission_id for source in sources} == set(submission_ids)
     assert len(sources) == 2
+    source_ids = {source.organizer_submission_id: source.id for source in sources}
+    first_title = db.scalar(
+        select(FieldEvidence).where(
+            FieldEvidence.source_id == source_ids[submission_ids[0]],
+            FieldEvidence.field_name == "title",
+        )
+    )
+    second_title = db.scalar(
+        select(FieldEvidence).where(
+            FieldEvidence.source_id == source_ids[submission_ids[1]],
+            FieldEvidence.field_name == "title",
+        )
+    )
+    assert first_title.review_state == "superseded"
+    assert second_title.review_state == "selected"
+    first_events = db.scalars(
+        select(EvidenceReviewEvent).where(EvidenceReviewEvent.evidence_id == first_title.id)
+    ).all()
+    second_events = db.scalars(
+        select(EvidenceReviewEvent).where(EvidenceReviewEvent.evidence_id == second_title.id)
+    ).all()
+    assert {(item.action, item.reviewer_user_id) for item in first_events} == {
+        ("accepted", first_reviewer_id),
+        ("superseded", second_reviewer_id),
+    }
+    assert [(item.action, item.reviewer_user_id) for item in second_events] == [
+        ("accepted", second_reviewer_id)
+    ]
     assert (
         db.scalar(
             select(func.count())
@@ -549,16 +802,18 @@ def test_approval_endpoint_requires_admin(approval_db, client):
     assert client.post("/api/v1/admin/submissions/123/approve").status_code == 403
 
 
-def _assert_approval_rolled_back(db: Session, submission_id: int, before: dict[str, int]):
+def _assert_approval_rolled_back(
+    db: Session, submission_id: int, before: dict[str, object]
+):
     db.expire_all()
     submission = db.get(OrganizerSubmission, submission_id)
     assert submission.status == "under_review"
     assert submission.approved_competition_id is None
-    assert _counts(db) == before
+    assert _approval_state_snapshot(db, submission_id) == before
 
 
 @pytest.mark.parametrize(
-    "failure_point", ["missing_evidence", "invalid_category", "accept_evidence"]
+    "failure_point", ["missing_evidence", "invalid_category", "submission_acceptance"]
 )
 def test_missing_or_unacceptable_evidence_rolls_back_all_changes(
     approval_db, client, monkeypatch, failure_point
@@ -569,7 +824,7 @@ def test_missing_or_unacceptable_evidence_rolls_back_all_changes(
     submission_id, _ = _make_under_review(client, db, categories=True)
     _admin_login(client, db, f"evidence-failure-{failure_point}")
     admin_token = client.cookies.get("fynd_session")
-    before = _counts(db)
+    before = _approval_state_snapshot(db, submission_id)
     if failure_point == "missing_evidence":
         monkeypatch.setattr(service, "_approval_evidence_specs", lambda *_args: [])
     elif failure_point == "invalid_category":
@@ -583,12 +838,21 @@ def test_missing_or_unacceptable_evidence_rolls_back_all_changes(
             ),
         )
     else:
+        original_accept = service.accept_submission_evidence
+        first_accept = True
+
+        def accept_then_fail(*args, **kwargs):
+            nonlocal first_accept
+            accepted = original_accept(*args, **kwargs)
+            if first_accept:
+                first_accept = False
+                raise ReviewError("simulated failure after evidence acceptance")
+            return accepted
+
         monkeypatch.setattr(
             service,
-            "accept_evidence",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                ReviewError("simulated evidence failure")
-            ),
+            "accept_submission_evidence",
+            accept_then_fail,
         )
     failure_client = TestClient(app, raise_server_exceptions=False)
     failure_client.cookies.set("fynd_session", admin_token)
@@ -597,7 +861,16 @@ def test_missing_or_unacceptable_evidence_rolls_back_all_changes(
     _assert_approval_rolled_back(db, submission_id, before)
 
 
-@pytest.mark.parametrize("failure_point", ["relationship", "publication", "review_event"])
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "relationship",
+        "canonical_application",
+        "evidence_review_event",
+        "submission_review_event",
+        "publication",
+    ],
+)
 def test_approval_failures_roll_back_competition_source_and_evidence(
     approval_db, client, monkeypatch, failure_point
 ):
@@ -607,7 +880,7 @@ def test_approval_failures_roll_back_competition_source_and_evidence(
     submission_id, _ = _make_under_review(client, db)
     _admin_login(client, db, f"transaction-failure-{failure_point}")
     admin_token = client.cookies.get("fynd_session")
-    before = _counts(db)
+    before = _approval_state_snapshot(db, submission_id)
     if failure_point == "relationship":
 
         def fail_relationship_insert(session, _flush_context, _instances):
@@ -615,30 +888,40 @@ def test_approval_failures_roll_back_competition_source_and_evidence(
                 raise RuntimeError("simulated relationship failure")
 
         event.listen(db, "before_flush", fail_relationship_insert)
-    elif failure_point == "review_event":
+    elif failure_point == "evidence_review_event":
 
-        def fail_review_event_insert(session, _flush_context, _instances):
+        def fail_evidence_review_event_insert(session, _flush_context):
+            if any(isinstance(row, EvidenceReviewEvent) for row in session.new):
+                raise RuntimeError("simulated evidence review-event insertion failure")
+
+        event.listen(db, "after_flush", fail_evidence_review_event_insert)
+    elif failure_point == "submission_review_event":
+
+        def fail_review_event_insert(session, _flush_context):
             if any(isinstance(row, SubmissionReviewEvent) for row in session.new):
                 raise RuntimeError("simulated review-event insertion failure")
 
-        event.listen(db, "before_flush", fail_review_event_insert)
-    elif failure_point == "publication":
-        monkeypatch.setattr(
-            service,
-            "_publish_approved_competition",
-            lambda _db, _competition: (_ for _ in ()).throw(
-                RuntimeError("simulated publication failure")
-            ),
-        )
-    else:
-        monkeypatch.setattr(
-            service,
-            "_record_approval_event",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError("simulated review-event failure")
-            ),
-        )
+        event.listen(db, "after_flush", fail_review_event_insert)
+    elif failure_point == "canonical_application":
+        from app.review import service as review_service
 
+        original_apply = review_service._apply_canonical_value
+
+        def apply_then_fail(competition, evidence):
+            original_apply(competition, evidence)
+            db.flush()
+            raise RuntimeError("simulated canonical application failure")
+
+        monkeypatch.setattr(review_service, "_apply_canonical_value", apply_then_fail)
+    elif failure_point == "publication":
+        original_publish = service._publish_approved_competition
+
+        def publish_then_fail(session, competition):
+            original_publish(session, competition)
+            session.flush()
+            raise RuntimeError("simulated post-publication failure")
+
+        monkeypatch.setattr(service, "_publish_approved_competition", publish_then_fail)
     try:
         failure_client = TestClient(app, raise_server_exceptions=False)
         failure_client.cookies.set("fynd_session", admin_token)
@@ -646,8 +929,10 @@ def test_approval_failures_roll_back_competition_source_and_evidence(
     finally:
         if failure_point == "relationship":
             event.remove(db, "before_flush", fail_relationship_insert)
-        if failure_point == "review_event":
-            event.remove(db, "before_flush", fail_review_event_insert)
+        if failure_point == "evidence_review_event":
+            event.remove(db, "after_flush", fail_evidence_review_event_insert)
+        if failure_point == "submission_review_event":
+            event.remove(db, "after_flush", fail_review_event_insert)
 
     assert response.status_code == 500
     _assert_approval_rolled_back(db, submission_id, before)
@@ -757,6 +1042,14 @@ def test_concurrent_approval_attempts_publish_once_and_record_one_event(monkeypa
             )
             source_ids = select(CompetitionSource.id).where(
                 CompetitionSource.organizer_submission_id == submission_id
+            )
+            evidence_ids = select(FieldEvidence.id).where(
+                FieldEvidence.source_id.in_(source_ids)
+            )
+            db.execute(
+                delete(EvidenceReviewEvent).where(
+                    EvidenceReviewEvent.evidence_id.in_(evidence_ids)
+                )
             )
             db.execute(delete(FieldEvidence).where(FieldEvidence.source_id.in_(source_ids)))
             db.execute(

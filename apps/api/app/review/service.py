@@ -10,14 +10,20 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.auth.models import User
+from app.discovery.registry import RegistryError, authorize_source_operation
+from app.discovery.urls import UnsafeSourceUrl, validate_source_url
 from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS
 from app.models import (
     Category,
     Competition,
     CompetitionCategory,
     CompetitionSource,
+    EvidenceReviewEvent,
     FieldEvidence,
+    OrganizerSubmission,
     SourcePublisher,
+    SubmissionConsent,
 )
 
 
@@ -307,21 +313,21 @@ def get_competition_detail(session: Session, competition_id: int) -> dict[str, A
     return result
 
 
-def accept_evidence(session: Session, evidence_id: int, *, commit: bool = True) -> FieldEvidence:
+def accept_evidence(
+    session: Session,
+    evidence_id: int,
+    *,
+    reviewer: User | None = None,
+    commit: bool = True,
+) -> FieldEvidence:
     """Accept candidate evidence, optionally leaving the root transaction to its caller."""
     if not commit and not session.in_transaction():
         raise ReviewError("caller-managed evidence acceptance requires an active transaction")
     transaction = _transaction(session) if commit else nullcontext()
     with transaction, session.begin_nested():
-        evidence = session.scalar(
-            select(FieldEvidence).where(FieldEvidence.id == evidence_id).with_for_update()
-        )
+        evidence = session.get(FieldEvidence, evidence_id)
         if evidence is None:
             raise ReviewError(f"evidence {evidence_id} was not found")
-        if evidence.review_state != "candidate":
-            raise ReviewError(f"evidence {evidence_id} is already {evidence.review_state}")
-        if evidence.field_name != "category":
-            _validate_scalar_field_key(evidence.field_name, evidence.field_key)
         competition = session.scalar(
             select(Competition)
             .where(Competition.id == evidence.competition_id)
@@ -329,67 +335,209 @@ def accept_evidence(session: Session, evidence_id: int, *, commit: bool = True) 
         )
         if competition is None:
             raise ReviewError(f"competition {evidence.competition_id} was not found")
-        category: Category | None = None
-        category_is_primary = False
-        category_link: CompetitionCategory | None = None
-        if evidence.field_name == "category":
-            category, category_is_primary = _resolve_category_evidence(session, evidence)
-            category_link = session.scalar(
-                select(CompetitionCategory)
-                .where(
-                    CompetitionCategory.competition_id == competition.id,
-                    CompetitionCategory.category_id == category.id,
-                )
-                .with_for_update()
+        evidence = session.scalar(
+            select(FieldEvidence).where(FieldEvidence.id == evidence_id).with_for_update()
+        )
+        if evidence is None or evidence.review_state != "candidate":
+            state = "missing" if evidence is None else evidence.review_state
+            raise ReviewError(f"evidence {evidence_id} is already {state}")
+        source = session.scalar(
+            select(CompetitionSource)
+            .where(CompetitionSource.id == evidence.source_id)
+            .with_for_update()
+        )
+        if source is None:
+            raise ReviewError("evidence source no longer exists")
+        if not source.registry_source_id:
+            raise ReviewError(
+                "legacy evidence without trusted registry identity cannot be accepted"
             )
-            if category_is_primary:
-                another_primary = session.scalar(
-                    select(CompetitionCategory.category_id).where(
-                        CompetitionCategory.competition_id == competition.id,
-                        CompetitionCategory.is_primary.is_(True),
-                        CompetitionCategory.category_id != category.id,
-                    )
-                )
-                if another_primary is not None:
-                    raise ReviewError(
-                        "competition already has a primary category; unassign it before "
-                        "assigning a new primary category"
-                    )
-        else:
-            _validate_event_date_precision(competition, evidence)
-            # Keep scalar evidence behavior unchanged.
-            _apply_canonical_value(competition, evidence)
-        previous = session.scalars(
-            select(FieldEvidence)
+        try:
+            registered = authorize_source_operation(source.registry_source_id, "internal_review")
+        except RegistryError as exc:
+            raise ReviewError(str(exc)) from exc
+        try:
+            validate_source_url(source.source_url or "", set(registered.access["allowed_hosts"]))
+        except UnsafeSourceUrl as exc:
+            raise ReviewError("persisted source URL is not allowed for internal review") from exc
+        if not isinstance(reviewer, User) or reviewer.id is None:
+            raise ReviewError("a persisted reviewer identity is required")
+        persisted_reviewer = session.scalar(
+            select(User).where(User.id == reviewer.id, User.is_active.is_(True))
+        )
+        if persisted_reviewer is None:
+            raise ReviewError("reviewer does not exist or is inactive")
+        _apply_accepted_evidence(session, evidence, competition, persisted_reviewer)
+    return evidence
+
+
+def accept_submission_evidence(
+    session: Session,
+    evidence_id: int,
+    *,
+    submission_id: int,
+    source_id: int,
+    competition_id: int,
+    validated_evidence_specs: dict[
+        int, tuple[str, str, dict[str, Any], str | None]
+    ],
+    reviewer: User,
+) -> FieldEvidence:
+    """Accept only evidence matching a validated, locked organizer submission snapshot."""
+    if not session.in_transaction():
+        raise ReviewError("submission evidence acceptance requires the approval transaction")
+    submission = session.scalar(
+        select(OrganizerSubmission)
+        .where(OrganizerSubmission.id == submission_id)
+        .with_for_update()
+    )
+    if submission is None or submission.status != "under_review":
+        raise ReviewError("submission is not locked in an approvable review state")
+    consent = session.scalar(
+        select(SubmissionConsent).where(
+            SubmissionConsent.submission_id == submission.id,
+            SubmissionConsent.submitter_user_id == submission.submitter_user_id,
+        )
+    )
+    if consent is None:
+        raise ReviewError("submission consent is missing or does not match its submitter")
+    if not isinstance(reviewer, User) or reviewer.id is None:
+        raise ReviewError("an authenticated administrator is required")
+    persisted_reviewer = session.scalar(
+        select(User).where(
+            User.id == reviewer.id,
+            User.is_active.is_(True),
+            User.is_admin.is_(True),
+        )
+    )
+    if persisted_reviewer is None:
+        raise ReviewError("an authenticated administrator is required")
+    if not session.in_transaction():
+        raise ReviewError("submission approval transaction is no longer active")
+    competition = session.scalar(
+        select(Competition).where(Competition.id == competition_id).with_for_update()
+    )
+    if competition is None:
+        raise ReviewError("submission evidence competition was not found")
+    evidence = session.scalar(
+        select(FieldEvidence)
+        .where(
+            FieldEvidence.id == evidence_id,
+            FieldEvidence.competition_id == competition_id,
+            FieldEvidence.source_id == source_id,
+        )
+        .with_for_update()
+    )
+    if evidence is None or evidence.review_state != "candidate":
+        raise ReviewError("evidence is not a candidate in this submission source")
+    expected_spec = validated_evidence_specs.get(evidence_id)
+    if expected_spec is None:
+        raise ReviewError("evidence ID is not part of the validated submission snapshot")
+    source = session.scalar(
+        select(CompetitionSource).where(
+            CompetitionSource.id == source_id,
+            CompetitionSource.competition_id == competition_id,
+            CompetitionSource.organizer_submission_id == submission.id,
+            CompetitionSource.source_kind == "organizer",
+            CompetitionSource.source_url == submission.official_url,
+        )
+    )
+    if source is None:
+        raise ReviewError("evidence source is not linked to the locked submission")
+    field_name, field_key, observed_value, excerpt = expected_spec
+    if (
+        evidence.field_name != field_name
+        or evidence.field_key != field_key
+        or evidence.observed_value != observed_value
+        or evidence.evidence_excerpt != excerpt
+    ):
+        raise ReviewError("evidence is outside the validated submission snapshot")
+    _apply_accepted_evidence(session, evidence, competition, persisted_reviewer)
+    return evidence
+
+
+def _apply_accepted_evidence(
+    session: Session,
+    evidence: FieldEvidence,
+    competition: Competition,
+    reviewer: User,
+) -> None:
+    if evidence.field_name != "category":
+        _validate_scalar_field_key(evidence.field_name, evidence.field_key)
+    category: Category | None = None
+    category_is_primary = False
+    category_link: CompetitionCategory | None = None
+    if evidence.field_name == "category":
+        category, category_is_primary = _resolve_category_evidence(session, evidence)
+        category_link = session.scalar(
+            select(CompetitionCategory)
             .where(
-                FieldEvidence.competition_id == evidence.competition_id,
-                FieldEvidence.field_name == evidence.field_name,
-                FieldEvidence.field_key == evidence.field_key,
-                FieldEvidence.review_state == "selected",
-                FieldEvidence.id != evidence.id,
+                CompetitionCategory.competition_id == competition.id,
+                CompetitionCategory.category_id == category.id,
             )
             .with_for_update()
-        ).all()
-        now = datetime.now(UTC)
-        for previous_evidence in previous:
-            previous_evidence.review_state = "superseded"
-        if category is not None:
-            # Release the selected-evidence unique key before selecting its replacement.
-            session.flush()
-            if category_link is None:
-                session.add(
-                    CompetitionCategory(
-                        competition_id=competition.id,
-                        category_id=category.id,
-                        is_primary=category_is_primary,
-                    )
+        )
+        if category_is_primary:
+            another_primary = session.scalar(
+                select(CompetitionCategory.category_id).where(
+                    CompetitionCategory.competition_id == competition.id,
+                    CompetitionCategory.is_primary.is_(True),
+                    CompetitionCategory.category_id != category.id,
                 )
-            elif category_is_primary:
-                category_link.is_primary = True
-        evidence.review_state = "selected"
-        evidence.reviewed_at = now
+            )
+            if another_primary is not None:
+                raise ReviewError(
+                    "competition already has a primary category; unassign it before "
+                    "assigning a new primary category"
+                )
+    else:
+        _validate_event_date_precision(competition, evidence)
+        _apply_canonical_value(competition, evidence)
+    previous = session.scalars(
+        select(FieldEvidence)
+        .where(
+            FieldEvidence.competition_id == evidence.competition_id,
+            FieldEvidence.field_name == evidence.field_name,
+            FieldEvidence.field_key == evidence.field_key,
+            FieldEvidence.review_state == "selected",
+            FieldEvidence.id != evidence.id,
+        )
+        .order_by(FieldEvidence.id)
+        .with_for_update()
+    ).all()
+    for previous_evidence in previous:
+        session.add(EvidenceReviewEvent(
+            evidence_id=previous_evidence.id,
+            reviewer_user_id=reviewer.id,
+            action="superseded",
+            previous_state="selected",
+            new_state="superseded",
+        ))
+    now = datetime.now(UTC)
+    for previous_evidence in previous:
+        previous_evidence.review_state = "superseded"
+    if category is not None:
         session.flush()
-    return evidence
+        if category_link is None:
+            session.add(
+                CompetitionCategory(
+                    competition_id=competition.id,
+                    category_id=category.id,
+                    is_primary=category_is_primary,
+                )
+            )
+        elif category_is_primary:
+            category_link.is_primary = True
+    evidence.review_state = "selected"
+    evidence.reviewed_at = now
+    session.add(EvidenceReviewEvent(
+        evidence_id=evidence.id,
+        reviewer_user_id=reviewer.id,
+        action="accepted",
+        previous_state="candidate",
+        new_state="selected",
+    ))
+    session.flush()
 
 
 def _resolve_category_evidence(
@@ -457,7 +605,13 @@ def create_category_proposal(
     return proposal
 
 
-def unassign_category(session: Session, competition_id: int, category_slug: str) -> None:
+def unassign_category(
+    session: Session,
+    competition_id: int,
+    category_slug: str,
+    *,
+    reviewer: User | None = None,
+) -> None:
     with _transaction(session), session.begin_nested():
         competition = session.scalar(
             select(Competition)
@@ -481,7 +635,6 @@ def unassign_category(session: Session, competition_id: int, category_slug: str)
             raise ReviewError(
                 f"category '{category_slug}' is not assigned to competition {competition_id}"
             )
-        session.delete(link)
         selected_evidence = session.scalars(
             select(FieldEvidence)
             .where(
@@ -492,14 +645,34 @@ def unassign_category(session: Session, competition_id: int, category_slug: str)
             )
             .with_for_update()
         ).all()
+        if not isinstance(reviewer, User) or reviewer.id is None:
+            raise ReviewError("a persisted reviewer identity is required")
+        persisted_reviewer = session.scalar(
+            select(User).where(User.id == reviewer.id, User.is_active.is_(True))
+        )
+        if persisted_reviewer is None:
+            raise ReviewError("reviewer does not exist or is inactive")
+
+        session.delete(link)
         now = datetime.now(UTC)
         for evidence in selected_evidence:
             evidence.review_state = "superseded"
             evidence.reviewed_at = now
+            session.add(
+                EvidenceReviewEvent(
+                    evidence_id=evidence.id,
+                    reviewer_user_id=persisted_reviewer.id,
+                    action="superseded",
+                    previous_state="selected",
+                    new_state="superseded",
+                )
+            )
         session.flush()
 
 
-def reject_evidence(session: Session, evidence_id: int) -> FieldEvidence:
+def reject_evidence(
+    session: Session, evidence_id: int, *, reviewer: User | None = None
+) -> FieldEvidence:
     with _transaction(session), session.begin_nested():
         evidence = session.scalar(
             select(FieldEvidence).where(FieldEvidence.id == evidence_id).with_for_update()
@@ -508,7 +681,21 @@ def reject_evidence(session: Session, evidence_id: int) -> FieldEvidence:
             raise ReviewError(f"evidence {evidence_id} was not found")
         if evidence.review_state != "candidate":
             raise ReviewError(f"evidence {evidence_id} is already {evidence.review_state}")
+        if not isinstance(reviewer, User) or reviewer.id is None:
+            raise ReviewError("a persisted reviewer identity is required")
+        persisted_reviewer = session.scalar(
+            select(User).where(User.id == reviewer.id, User.is_active.is_(True))
+        )
+        if persisted_reviewer is None:
+            raise ReviewError("reviewer does not exist or is inactive")
         evidence.review_state = "rejected"
         evidence.reviewed_at = datetime.now(UTC)
+        session.add(EvidenceReviewEvent(
+            evidence_id=evidence.id,
+            reviewer_user_id=persisted_reviewer.id,
+            action="rejected",
+            previous_state="candidate",
+            new_state="rejected",
+        ))
         session.flush()
     return evidence

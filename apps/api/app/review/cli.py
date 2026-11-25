@@ -6,12 +6,8 @@ from typing import Any
 from app.database import SessionLocal
 from app.review import (
     ReviewError,
-    accept_evidence,
-    create_category_proposal,
     get_competition_detail,
     list_pending_evidence,
-    reject_evidence,
-    unassign_category,
 )
 
 
@@ -29,95 +25,23 @@ def main() -> int:
     )
     show_parser = commands.add_parser("show", help="inspect a competition and its sources")
     show_parser.add_argument("competition_id", type=int)
-    proposal_parser = commands.add_parser(
-        "propose-category", help="propose a canonical category for a competition"
-    )
-    proposal_parser.add_argument("competition_id", type=int)
-    proposal_parser.add_argument("category_slug")
-    proposal_parser.add_argument("--source-id", type=int, required=True)
-    proposal_parser.add_argument(
-        "--primary", action="store_true", help="propose this as the primary category"
-    )
-    unassign_parser = commands.add_parser(
-        "unassign-category", help="remove an assigned category and supersede its approval"
-    )
-    unassign_parser.add_argument("competition_id", type=int)
-    unassign_parser.add_argument("category_slug")
-    for name, help_text in (
-        ("accept", "accept an evidence record and apply its supported canonical value"),
-        ("reject", "reject a candidate evidence record"),
-    ):
-        command_parser = commands.add_parser(name, help=help_text)
-        command_parser.add_argument("evidence_id", type=int)
+    for name in ("propose-category", "unassign-category", "accept", "reject"):
+        command_parser = commands.add_parser(
+            name, help=f"disabled: use the future authenticated admin API ({name})"
+        )
+        command_parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.command not in {"list", "show"}:
+        parser.error(
+            "review mutations are disabled in this CLI; use the future authenticated admin API"
+        )
 
     try:
         with SessionLocal() as session:
             if args.command == "list":
                 _print_json(list_pending_evidence(session, args.limit, args.field))
-            elif args.command == "show":
-                _print_json(get_competition_detail(session, args.competition_id))
-            elif args.command == "propose-category":
-                evidence = create_category_proposal(
-                    session,
-                    args.competition_id,
-                    args.category_slug,
-                    args.source_id,
-                    is_primary=args.primary,
-                )
-                _print_json(
-                    {
-                        "evidence_id": evidence.id,
-                        "competition_id": evidence.competition_id,
-                        "category_name": evidence.observed_value["name"],
-                        "category_slug": evidence.field_key,
-                        "is_primary": evidence.observed_value["is_primary"],
-                        "review_state": evidence.review_state,
-                    }
-                )
-            elif args.command == "unassign-category":
-                unassign_category(session, args.competition_id, args.category_slug)
-                _print_json(
-                    {
-                        "competition_id": args.competition_id,
-                        "category_slug": args.category_slug,
-                        "status": "unassigned",
-                    }
-                )
-            elif args.command == "accept":
-                evidence = accept_evidence(session, args.evidence_id)
-                _print_json(
-                    {
-                        "evidence_id": evidence.id,
-                        "competition_id": evidence.competition_id,
-                        "field_name": evidence.field_name,
-                        "category_name": evidence.observed_value.get("name")
-                        if evidence.field_name == "category"
-                        else None,
-                        "category_slug": evidence.field_key
-                        if evidence.field_name == "category"
-                        else None,
-                        "review_state": evidence.review_state,
-                        "reviewed_at": evidence.reviewed_at,
-                    }
-                )
             else:
-                evidence = reject_evidence(session, args.evidence_id)
-                _print_json(
-                    {
-                        "evidence_id": evidence.id,
-                        "competition_id": evidence.competition_id,
-                        "field_name": evidence.field_name,
-                        "category_name": evidence.observed_value.get("name")
-                        if evidence.field_name == "category"
-                        else None,
-                        "category_slug": evidence.field_key
-                        if evidence.field_name == "category"
-                        else None,
-                        "review_state": evidence.review_state,
-                        "reviewed_at": evidence.reviewed_at,
-                    }
-                )
+                _print_json(get_competition_detail(session, args.competition_id))
     except (ReviewError, ValueError) as exc:
         print(f"Review failed: {exc}", file=sys.stderr)
         return 1
