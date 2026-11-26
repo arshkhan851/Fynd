@@ -74,20 +74,16 @@ cd apps\api
 Use `--limit` and `--page-size` to tune the bounded listing request. The command requires working Kaggle credentials and database connectivity; tests do not contact Kaggle.
 
 ### Manual evidence review
-Discovery stores extracted values as candidate evidence; canonical competition fields and category assignments change only when evidence is accepted. Seed the canonical category list idempotently, list pending category proposals, inspect a competition and its source IDs/evidence, or propose a category using an existing slug:
+Discovery stores extracted values as candidate evidence; canonical competition fields and category assignments change only after authorized review. Seed the canonical category list idempotently, list pending evidence, or inspect a competition and its sources with the read-only CLI:
 
 ```powershell
 .\.venv\Scripts\python.exe -m app.category_seed
 .\.venv\Scripts\python.exe -m app.review.cli list --limit 100
 .\.venv\Scripts\python.exe -m app.review.cli list --field category --limit 100
 .\.venv\Scripts\python.exe -m app.review.cli show 123
-.\.venv\Scripts\python.exe -m app.review.cli propose-category 123 ai-machine-learning --source-id 456
-.\.venv\Scripts\python.exe -m app.review.cli accept 789
-.\.venv\Scripts\python.exe -m app.review.cli reject 789
-.\.venv\Scripts\python.exe -m app.review.cli unassign-category 123 ai-machine-learning
 ```
 
-The category seed command reports newly created, already-existing, and conflicting categories; conflicts are left untouched. `propose-category` requires the competition ID, an existing category slug, and a source ID belonging to that competition. Add `--primary` to propose it as the primary category. Review proposals with `list --field category` or `show`, then use the normal `accept` or `reject` commands. Each accepted category is keyed by its canonical slug, and category relationships are not duplicated. A competition can have only one primary category; unassign the current primary explicitly before approving a different primary. `unassign-category` removes the assignment and supersedes its selected evidence. It does not delete the canonical category. Category, topic, prize, and registration-status proposals are not inferred or created automatically.
+The review CLI is read-only. Authenticated administrators can list and inspect evidence through `GET /api/v1/admin/evidence` and `GET /api/v1/admin/evidence/{evidence_id}`, and accept or reject a candidate through `POST /api/v1/admin/evidence/{evidence_id}/accept` or `/reject`. These endpoints use the active administrator's session identity; reviewer IDs are not supplied in request data. Category proposal creation and category unassignment are not available through this API. Category, topic, prize, and registration-status proposals are not inferred or created automatically.
 
 Acceptance remains supported for `title`, `description`, `eligibility_summary`, `format`, `event_timezone`, `official_url`, `registration_url`, `registration_opens`, `registration_deadline`, `event_starts`, and `event_ends`. Date evidence must provide either an ISO date in an `on` value or an offset-aware ISO datetime in an `at` value. Format, timezone, and URL evidence is validated before applying it. Organizer, topic, prize, and registration-status evidence can be inspected or rejected, but cannot be accepted until their canonical mapping is implemented. The CLI does not merge competitions.
 

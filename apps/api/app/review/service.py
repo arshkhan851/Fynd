@@ -255,6 +255,7 @@ def get_competition_detail(session: Session, competition_id: int) -> dict[str, A
         "competition": {
             "id": competition.id,
             "title": competition.title,
+            "is_published": competition.is_published,
             "description": competition.description,
             "eligibility_summary": competition.eligibility_summary,
             "format": competition.format,
@@ -269,6 +270,17 @@ def get_competition_detail(session: Session, competition_id: int) -> dict[str, A
             "event_ends_at": competition.event_ends_at,
             "event_ends_on": competition.event_ends_on,
             "event_timezone": competition.event_timezone,
+            "categories": [
+                {
+                    "name": link.category.name,
+                    "slug": link.category.slug,
+                    "is_primary": link.is_primary,
+                }
+                for link in sorted(
+                    competition.category_links,
+                    key=lambda item: (item.category.name.lower(), item.category.slug),
+                )
+            ],
         },
         "sources": [],
     }
@@ -279,6 +291,7 @@ def get_competition_detail(session: Session, competition_id: int) -> dict[str, A
                 "source_url": source.source_url,
                 "normalized_url": source.normalized_url,
                 "source_kind": source.source_kind,
+                "registry_source_id": source.registry_source_id,
                 "publisher": source.publisher.name if source.publisher else None,
                 "discovered_at": source.discovered_at,
                 "check_status": source.check_status,
@@ -311,6 +324,53 @@ def get_competition_detail(session: Session, competition_id: int) -> dict[str, A
             }
         )
     return result
+
+
+def get_evidence_detail(session: Session, evidence_id: int) -> dict[str, Any]:
+    evidence = session.get(FieldEvidence, evidence_id)
+    if evidence is None:
+        raise ReviewError(f"evidence {evidence_id} was not found")
+
+    competition_detail = get_competition_detail(session, evidence.competition_id)
+    source_detail = next(
+        (
+            source
+            for source in competition_detail["sources"]
+            if source["id"] == evidence.source_id
+        ),
+        None,
+    )
+    if source_detail is None:
+        raise ReviewError("evidence source no longer exists")
+    evidence_detail = next(
+        (item for item in source_detail["evidence"] if item["id"] == evidence_id),
+        None,
+    )
+    if evidence_detail is None:
+        raise ReviewError(f"evidence {evidence_id} was not found")
+
+    source_context = {key: value for key, value in source_detail.items() if key != "evidence"}
+    review_events = session.scalars(
+        select(EvidenceReviewEvent)
+        .where(EvidenceReviewEvent.evidence_id == evidence_id)
+        .order_by(EvidenceReviewEvent.created_at, EvidenceReviewEvent.id)
+    ).all()
+    return {
+        "evidence": evidence_detail,
+        "competition": competition_detail["competition"],
+        "source": source_context,
+        "review_events": [
+            {
+                "id": event.id,
+                "reviewer_user_id": event.reviewer_user_id,
+                "action": event.action,
+                "previous_state": event.previous_state,
+                "new_state": event.new_state,
+                "created_at": event.created_at,
+            }
+            for event in review_events
+        ],
+    }
 
 
 def accept_evidence(
