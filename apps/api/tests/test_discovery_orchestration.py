@@ -29,6 +29,7 @@ def _source(*, hosts=None, max_bytes=20_000):
     return SimpleNamespace(
         id=SOURCE_ID,
         publisher_name="Fixture Publisher",
+        source_kind="aggregator",
         access={
             "method": "html",
             "allowed_hosts": hosts or ["example.test"],
@@ -242,6 +243,8 @@ def test_success_returns_registry_context_and_validated_observations(monkeypatch
     assert result.registry_source_id == SOURCE_ID
     assert result.source_url == SOURCE_URL
     assert result.publisher_name == "Fixture Publisher"
+    assert result.source_kind == "aggregator"
+    assert result.allowed_hosts == ("example.test",)
     assert result.observations["title"].value == "Fynd Demo"
 
 

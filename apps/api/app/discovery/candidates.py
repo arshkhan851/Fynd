@@ -151,6 +151,7 @@ class DiscoveryCandidate:
     event_timezone: TextObservation | None = None
     format: FormatObservation | None = None
     eligibility_summary: TextObservation | None = None
+    title_excerpt: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.title, str):
@@ -165,6 +166,7 @@ class DiscoveryCandidate:
             raise ValueError("external ID must be a string")
         if not self.title.strip():
             raise ValueError("candidate title must not be empty")
+        _validate_excerpt(self.title_excerpt)
         if not self.publisher_name.strip():
             raise ValueError("publisher name must not be empty")
         if self.source_kind not in {"official", "organizer", "aggregator", "other"}:

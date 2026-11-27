@@ -29,6 +29,8 @@ class AuthorizedExtractionResult:
     registry_source_id: str
     source_url: str
     publisher_name: str
+    source_kind: str
+    allowed_hosts: tuple[str, ...]
     observations: dict[str, ExtractionObservation]
 
 
@@ -141,5 +143,7 @@ class AuthorizedSourceExtraction:
             registry_source_id=source.id,
             source_url=safe_url,
             publisher_name=source.publisher_name,
+            source_kind=source.source_kind,
+            allowed_hosts=tuple(sorted(allowed_hosts)),
             observations=observations,
         )

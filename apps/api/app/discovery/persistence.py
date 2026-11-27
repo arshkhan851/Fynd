@@ -86,7 +86,9 @@ def _candidate_evidence_specs(
     title_value = {"title": title}
     if candidate.external_id:
         title_value["source_external_id"] = candidate.external_id
-    specs: list[tuple[str, dict, str | None]] = [("title", title_value, title)]
+    specs: list[tuple[str, dict, str | None]] = [
+        ("title", title_value, candidate.title_excerpt or title)
+    ]
     skipped_fields: list[str] = []
 
     for field_name in _STRUCTURED_OBSERVATION_FIELDS:

@@ -25,6 +25,10 @@ from app.discovery.candidates import (  # noqa: E402
     TextObservation,
     UrlObservation,
 )
+from app.discovery.extraction_persistence import (  # noqa: E402
+    persist_extraction_candidate,
+)
+from app.discovery.orchestration import AuthorizedExtractionResult  # noqa: E402
 from app.models import (  # noqa: E402
     Competition,
     CompetitionSource,
@@ -100,6 +104,156 @@ def persist_candidates(session, candidates, allowed_hosts):
         allowed_hosts,
         registry_source_id=source_id,
     )
+
+
+def _validated_extraction(source_url, *, publisher_name="Extracted Events"):
+    return AuthorizedExtractionResult(
+        registry_source_id=f"synthetic-test-source:{publisher_name}",
+        source_url=source_url,
+        publisher_name=publisher_name,
+        source_kind="aggregator",
+        allowed_hosts=("example.test",),
+        observations={
+            "title": TextObservation("Extracted Demo", "The Extracted Demo"),
+            "description": TextObservation("A demo event", "A two-day demo event"),
+        },
+    )
+
+
+def test_extraction_persists_unpublished_candidate_and_all_evidence(db_session):
+    source_url = "https://events.example.test/2027/extracted"
+
+    summary = persist_extraction_candidate(
+        db_session, _validated_extraction(source_url)
+    )
+
+    assert summary.discovered == 1
+    assert summary.failed == summary.existing == summary.skipped == 0
+    source = db_session.scalar(
+        select(CompetitionSource).where(CompetitionSource.normalized_url == source_url)
+    )
+    assert source is not None
+    assert source.registry_source_id == "synthetic-test-source:Extracted Events"
+    competition = db_session.get(Competition, source.competition_id)
+    assert competition is not None
+    assert competition.is_published is False
+    assert competition.title is None
+    assert competition.description is None
+
+    evidence = db_session.scalars(
+        select(FieldEvidence).where(FieldEvidence.source_id == source.id)
+    ).all()
+    by_field = {item.field_name: item for item in evidence}
+    assert set(by_field) == {"title", "description"}
+    assert by_field["title"].observed_value == {"title": "Extracted Demo"}
+    assert by_field["title"].evidence_excerpt == "The Extracted Demo"
+    assert by_field["description"].observed_value == {"description": "A demo event"}
+    assert by_field["description"].evidence_excerpt == "A two-day demo event"
+    assert all(item.review_state == "candidate" for item in evidence)
+
+
+def test_extraction_persistence_retains_duplicate_url_behavior(db_session):
+    source_url = "https://events.example.test/2027/extracted-duplicate"
+    result = _validated_extraction(source_url)
+
+    first = persist_extraction_candidate(db_session, result)
+    second = persist_extraction_candidate(db_session, result)
+
+    assert first.discovered == 1
+    assert second.existing == 1
+    assert second.failed == 0
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(CompetitionSource)
+            .where(CompetitionSource.normalized_url == source_url)
+        )
+        == 1
+    )
+    assert (
+        db_session.scalar(
+            select(func.count())
+            .select_from(FieldEvidence)
+            .where(FieldEvidence.source_id.in_(
+                select(CompetitionSource.id).where(
+                    CompetitionSource.normalized_url == source_url
+                )
+            ))
+        )
+        == 2
+    )
+
+
+def test_extraction_persistence_rollback_removes_partial_candidate(
+    db_session, monkeypatch
+):
+    source_url = "https://events.example.test/2027/extracted-rollback"
+    original_flush = db_session.flush
+    partial_competition_ids = []
+
+    def fail_when_evidence_is_pending(objects=None):
+        pending_evidence = [
+            row for row in db_session.new if isinstance(row, FieldEvidence)
+        ]
+        if pending_evidence:
+            partial_competition_ids.extend(row.competition_id for row in pending_evidence)
+            raise RuntimeError("simulated extracted evidence insert failure")
+        return original_flush(objects=objects)
+
+    monkeypatch.setattr(db_session, "flush", fail_when_evidence_is_pending)
+    summary = persist_extraction_candidate(
+        db_session, _validated_extraction(source_url)
+    )
+
+    assert summary.failed == 1
+    assert summary.discovered == summary.existing == 0
+    assert partial_competition_ids
+    assert all(db_session.get(Competition, item) is None for item in partial_competition_ids)
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == source_url)
+    ) == 0
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(FieldEvidence)
+        .where(FieldEvidence.source_id.in_(
+            select(CompetitionSource.id).where(
+                CompetitionSource.normalized_url == source_url
+            )
+        ))
+    ) == 0
+
+
+def test_extraction_persistence_keeps_field_scope_filtering(db_session, monkeypatch):
+    def title_only_authorization(source_id, operation):
+        assert operation in {"store", "internal_review"}
+        return SimpleNamespace(
+            id=source_id,
+            publisher_name="Extracted Events",
+            source_kind="aggregator",
+            access={"allowed_hosts": ["example.test"]},
+            use={"fields": ["title"]},
+        )
+
+    monkeypatch.setattr(persistence, "authorize_source_operation", title_only_authorization)
+    source_url = "https://events.example.test/2027/extracted-title-only"
+    summary = persist_extraction_candidate(
+        db_session, _validated_extraction(source_url)
+    )
+
+    assert summary.discovered == 1
+    assert summary.skipped == 1
+    assert summary.skipped_fields == ("description",)
+    source = db_session.scalar(
+        select(CompetitionSource).where(CompetitionSource.normalized_url == source_url)
+    )
+    assert source is not None
+    evidence = db_session.scalars(
+        select(FieldEvidence).where(FieldEvidence.source_id == source.id)
+    ).all()
+    assert [item.field_name for item in evidence] == ["title"]
+    assert evidence[0].evidence_excerpt == "The Extracted Demo"
 
 
 def test_repeat_source_urls_are_idempotent(db_session):
