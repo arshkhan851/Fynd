@@ -33,6 +33,32 @@ class DateTimeObservation:
 DateObservation = DateOnlyObservation | DateTimeObservation
 
 
+def parse_date_observation(value: object, field_name: str) -> DateObservation:
+    """Parse the review contract's one-key date/datetime payload into a typed observation."""
+    if not isinstance(value, dict) or len(value) != 1:
+        raise ValueError(f"{field_name} evidence must contain exactly one 'on' or 'at' value")
+    if "on" in value:
+        raw = value["on"]
+        if not isinstance(raw, str):
+            raise ValueError(f"{field_name} 'on' value must be an ISO date string")
+        try:
+            return DateOnlyObservation(date.fromisoformat(raw))
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 'on' value must be an ISO date") from exc
+    if "at" in value:
+        raw = value["at"]
+        if not isinstance(raw, str):
+            raise ValueError(f"{field_name} 'at' value must be an ISO datetime string")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 'at' value must be an ISO datetime") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"{field_name} 'at' value must include a timezone offset")
+        return DateTimeObservation(parsed)
+    raise ValueError(f"{field_name} evidence must contain exactly one 'on' or 'at' value")
+
+
 @dataclass(frozen=True, slots=True)
 class TextObservation:
     value: str

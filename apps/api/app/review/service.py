@@ -11,6 +11,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.auth.models import User
+from app.discovery.candidates import (
+    DateOnlyObservation,
+    DateTimeObservation,
+    parse_date_observation,
+)
 from app.discovery.registry import RegistryError, authorize_source_operation
 from app.discovery.urls import UnsafeSourceUrl, validate_source_url
 from app.evidence_vocabulary import REVIEW_SUPPORTED_EVIDENCE_FIELDS
@@ -68,28 +73,15 @@ def _validate_timezone(value: Any) -> str:
 
 
 def _validate_date_evidence(value: Any, field_name: str) -> tuple[date | datetime, str]:
-    if not isinstance(value, dict) or len(value) != 1:
-        raise ReviewError(f"{field_name} evidence must contain exactly one 'on' or 'at' value")
-    if "on" in value:
-        raw = value["on"]
-        if not isinstance(raw, str):
-            raise ReviewError(f"{field_name} 'on' value must be an ISO date string")
-        try:
-            return date.fromisoformat(raw), "on"
-        except ValueError as exc:
-            raise ReviewError(f"{field_name} 'on' value must be an ISO date") from exc
-    if "at" in value:
-        raw = value["at"]
-        if not isinstance(raw, str):
-            raise ReviewError(f"{field_name} 'at' value must be an ISO datetime string")
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ReviewError(f"{field_name} 'at' value must be an ISO datetime") from exc
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ReviewError(f"{field_name} 'at' value must include a timezone offset")
-        return parsed, "at"
-    raise ReviewError(f"{field_name} evidence must contain exactly one 'on' or 'at' value")
+    try:
+        observation = parse_date_observation(value, field_name)
+    except ValueError as exc:
+        raise ReviewError(str(exc)) from exc
+    if isinstance(observation, DateOnlyObservation):
+        return observation.on, "on"
+    if isinstance(observation, DateTimeObservation):
+        return observation.at, "at"
+    raise ReviewError(f"{field_name} evidence must contain a date observation")
 
 
 _SCALAR_FIELD_MAPPINGS: dict[str, tuple[str, Callable[[Any], Any]]] = {
