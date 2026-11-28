@@ -5,6 +5,7 @@ from time import monotonic, sleep
 from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
 from integration_database_guard import guard_isolated_postgres_integration_tests
 from sqlalchemy import delete, exists, func, select, text
@@ -15,7 +16,11 @@ guard_isolated_postgres_integration_tests()
 
 from app.auth.models import User  # noqa: E402
 from app.database import SessionLocal, engine  # noqa: E402
-from app.discovery import DiscoveryCandidate, persistence  # noqa: E402
+from app.discovery import (  # noqa: E402
+    DiscoveryCandidate,
+    persistence,
+    run_authorized_extraction_pipeline,
+)
 from app.discovery import persist_candidates as _persist_candidates  # noqa: E402
 from app.discovery.candidates import (  # noqa: E402
     DateObservationField,
@@ -28,6 +33,7 @@ from app.discovery.candidates import (  # noqa: E402
 from app.discovery.extraction_persistence import (  # noqa: E402
     persist_extraction_candidate,
 )
+from app.discovery.ollama import OllamaExtractionClient  # noqa: E402
 from app.discovery.orchestration import AuthorizedExtractionResult  # noqa: E402
 from app.models import (  # noqa: E402
     Competition,
@@ -118,6 +124,189 @@ def _validated_extraction(source_url, *, publisher_name="Extracted Events"):
             "description": TextObservation("A demo event", "A two-day demo event"),
         },
     )
+
+
+def _run_pipeline_to_fixture_candidate(db_session, monkeypatch, *, suffix="Pipeline Events"):
+    registry_source_id = f"synthetic-test-source:{suffix}"
+    source_url = f"https://events.example.test/2027/{suffix.lower().replace(' ', '-')}"
+    page = (
+        b"<html><body><h1>Pipeline Demo</h1>"
+        b"<p>Open to learners.</p></body></html>"
+    )
+    extraction_json = (
+        '{"fields":[{"field":"title","value":"Pipeline Demo",'
+        '"evidence":"Pipeline Demo"},{"field":"description",'
+        '"value":"Open to learners.","evidence":"Open to learners."}]}'
+    )
+    events = []
+
+    def authorize(source_id, registry_path):
+        events.append("fetch_authorization")
+        assert source_id == registry_source_id
+        return SimpleNamespace(
+            id=registry_source_id,
+            publisher_name=suffix,
+            source_kind="aggregator",
+            access={"method": "html", "allowed_hosts": ["example.test"]},
+            limits={
+                "max_response_bytes": 10_000,
+                "max_retries": 1,
+                "min_request_interval_s": 0.01,
+            },
+        )
+
+    def fetch(request):
+        events.append("fetch")
+        return httpx.Response(200, content=page)
+
+    def model(request):
+        events.append("model")
+        return httpx.Response(200, json={"response": extraction_json})
+
+    monkeypatch.setattr(
+        "app.discovery.orchestration.authorize_source_execution", authorize
+    )
+    client = OllamaExtractionClient(
+        model="fixture-model", transport=httpx.MockTransport(model)
+    )
+    summary = run_authorized_extraction_pipeline(
+        db_session,
+        registry_source_id,
+        source_url,
+        ollama_client=client,
+        fetch_transport=httpx.MockTransport(fetch),
+    )
+    client.close()
+    return summary, source_url, events
+
+
+def test_pipeline_fetches_extracts_and_persists_unpublished_candidate(
+    db_session, monkeypatch
+):
+    summary, source_url, events = _run_pipeline_to_fixture_candidate(
+        db_session, monkeypatch
+    )
+
+    assert summary.discovered == 1
+    assert summary.failed == summary.existing == summary.skipped == 0
+    assert events == ["fetch_authorization", "fetch", "model"]
+    source = db_session.scalar(
+        select(CompetitionSource).where(CompetitionSource.normalized_url == source_url)
+    )
+    assert source is not None
+    assert source.registry_source_id == "synthetic-test-source:Pipeline Events"
+    competition = db_session.get(Competition, source.competition_id)
+    assert competition is not None
+    assert competition.is_published is False
+    assert competition.title is None
+    assert competition.description is None
+    evidence = db_session.scalars(
+        select(FieldEvidence)
+        .where(FieldEvidence.source_id == source.id)
+        .order_by(FieldEvidence.field_name)
+    ).all()
+    assert [(item.field_name, item.review_state) for item in evidence] == [
+        ("description", "candidate"),
+        ("title", "candidate"),
+    ]
+    assert {item.field_name: item.evidence_excerpt for item in evidence} == {
+        "description": "Open to learners.",
+        "title": "Pipeline Demo",
+    }
+
+
+def test_pipeline_persistence_failure_rolls_back_all_candidate_rows(
+    db_session, monkeypatch
+):
+    original_flush = db_session.flush
+    rollback_token = uuid4().hex
+    publisher_name = f"Pipeline Rollback {rollback_token}"
+    source_url = f"https://events.example.test/2027/pipeline-rollback-{rollback_token}"
+    events = []
+    registry_source_id = f"synthetic-test-source:{publisher_name}"
+    page = b"<html><body><h1>Pipeline Demo</h1></body></html>"
+    extraction_json = (
+        '{"fields":[{"field":"title","value":"Pipeline Demo",'
+        '"evidence":"Pipeline Demo"}]}'
+    )
+
+    def authorize(source_id, registry_path):
+        assert source_id == registry_source_id
+        return SimpleNamespace(
+            id=source_id,
+            publisher_name=publisher_name,
+            source_kind="aggregator",
+            access={"method": "html", "allowed_hosts": ["example.test"]},
+            limits={
+                "max_response_bytes": 10_000,
+                "max_retries": 1,
+                "min_request_interval_s": 0.01,
+            },
+        )
+
+    def fetch(request):
+        events.append("fetch")
+        return httpx.Response(200, content=page)
+
+    def model(request):
+        events.append("model")
+        return httpx.Response(200, json={"response": extraction_json})
+
+    partial_competition_ids = []
+
+    def fail_evidence_flush(objects=None):
+        pending_evidence = [
+            row for row in db_session.new if isinstance(row, FieldEvidence)
+        ]
+        if pending_evidence:
+            partial_competition_ids.extend(row.competition_id for row in pending_evidence)
+            raise RuntimeError("simulated end-to-end evidence insert failure")
+        return original_flush(objects=objects)
+
+    monkeypatch.setattr(
+        "app.discovery.orchestration.authorize_source_execution", authorize
+    )
+    monkeypatch.setattr(db_session, "flush", fail_evidence_flush)
+    client = OllamaExtractionClient(
+        model="fixture-model", transport=httpx.MockTransport(model)
+    )
+    try:
+        summary = run_authorized_extraction_pipeline(
+            db_session,
+            registry_source_id,
+            source_url,
+            ollama_client=client,
+            fetch_transport=httpx.MockTransport(fetch),
+        )
+    finally:
+        client.close()
+
+    assert summary.failed == 1
+    assert summary.discovered == summary.existing == 0
+    assert events == ["fetch", "model"]
+    assert partial_competition_ids
+    assert all(db_session.get(Competition, item) is None for item in partial_competition_ids)
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(SourcePublisher)
+        .where(SourcePublisher.name == publisher_name)
+    ) == 0
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == source_url)
+    ) == 0
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(FieldEvidence)
+        .where(
+            FieldEvidence.source_id.in_(
+                select(CompetitionSource.id).where(
+                    CompetitionSource.normalized_url == source_url
+                )
+            )
+        )
+    ) == 0
 
 
 def test_extraction_persists_unpublished_candidate_and_all_evidence(db_session):
