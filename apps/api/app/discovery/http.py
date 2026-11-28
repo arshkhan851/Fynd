@@ -5,6 +5,7 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
+from app.discovery.pinned_transport import PinnedHTTPTransport
 from app.discovery.urls import validate_source_url
 
 
@@ -13,6 +14,13 @@ class FetchError(RuntimeError):
 
 
 class BoundedHttpClient:
+    """Bounded HTTPS fetcher.
+
+    ``transport`` is a trusted dependency-injection seam, primarily for tests.
+    An alternate transport can bypass the default DNS-pinning guarantee, so it
+    must never be selected from untrusted input or runtime request data.
+    """
+
     def __init__(
         self,
         allowed_hosts: set[str],
@@ -42,7 +50,8 @@ class BoundedHttpClient:
         self._client = httpx.Client(
             timeout=timeout or httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
             follow_redirects=False,
-            transport=transport,
+            transport=transport if transport is not None else PinnedHTTPTransport(),
+            trust_env=False,
             headers={"User-Agent": "FyndDiscovery/0.1 (+https://github.com/fynd)"},
         )
 
