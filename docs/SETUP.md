@@ -63,15 +63,19 @@ The web app requests the first page with `limit=20` from `API_BASE_URL`. Set `AP
 API_BASE_URL=http://localhost:8000
 ```
 
-### Kaggle discovery
-Install the API requirements to add the official Kaggle client, then configure Kaggle authentication with `apps\api\.venv\Scripts\kaggle.exe auth login` from the repository root or `.\.venv\Scripts\kaggle.exe auth login` from `apps\api`; alternatively configure `KAGGLE_API_TOKEN` (never commit credentials). To manually run the bounded Kaggle listing adapter and persist up to 50 candidates:
+### Kaggle adapter setup and authorization
+The Kaggle adapter can be installed and its credentials configured as preparation: use `apps\api\.venv\Scripts\kaggle.exe auth login` from the repository root or `.\.venv\Scripts\kaggle.exe auth login` from `apps\api`; alternatively configure `KAGGLE_API_TOKEN` (never commit credentials). Adapter setup and credentials do not authorize discovery execution.
+
+The current entry in `docs/sources/registry.toml` marks Kaggle as `auditing` with `fetch = "unknown"`. The `--kaggle` CLI execution is therefore refused by registry authorization before Kaggle authentication or requests. It will remain unavailable until the registry's reviewed authorization state explicitly permits fetching. Tests use mocked clients and do not contact Kaggle.
+
+### Offline extraction evaluation
+Run the deterministic fixture replay from `apps\api`:
 
 ```powershell
-cd apps\api
-.\.venv\Scripts\python -m app.discovery.cli --kaggle --limit 50
+.\.venv\Scripts\python.exe -m app.discovery.evaluation
 ```
 
-Use `--limit` and `--page-size` to tune the bounded listing request. The command requires working Kaggle credentials and database connectivity; tests do not contact Kaggle.
+The benchmark reuses the Task 6A validator and fixed JSON fixture outputs. It does not fetch sources, call Ollama, authorize sources, or persist candidates. `expected_fields` in each fixture is the complete labeled set of supported facts for that sample. Field precision is correctly present field names divided by field names in accepted outputs; rejected outputs contribute no predictions. Field recall is correctly present field names divided by all expected field names; fields from rejected outputs count as misses. Exact-match accuracy is exact expected field/value pairs divided by all expected pairs; missing and rejected fields count as incorrect. Evidence grounding is exact, case-sensitive quote matches divided by evidence members in JSON-parseable outputs; malformed JSON has no quote denominator. Read precision alongside the separately reported validation acceptance/rejection counts because rejection can reduce the precision denominator. This small fixture corpus is a regression benchmark, not a production accuracy estimate; a matching quote does not establish semantic entailment.
 
 ### Manual evidence review
 Discovery stores extracted values as candidate evidence; canonical competition fields and category assignments change only after authorized review. Seed the canonical category list idempotently, list pending evidence, or inspect a competition and its sources with the read-only CLI:

@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "fixture_id": "grounded_complete",
+      "source_text": "Fynd Green Sprint is a student event. Details: Build a greener future. Registration deadline: 2027-05-10. Official URL: https://fynd.example/green-sprint",
+      "expected_fields": {
+        "title": "Fynd Green Sprint",
+        "description": "Build a greener future.",
+        "registration_deadline": {"on": "2027-05-10"},
+        "official_url": "https://fynd.example/green-sprint"
+      },
+      "model_output": "{\"fields\":[{\"field\":\"title\",\"value\":\"Fynd Green Sprint\",\"evidence\":\"Fynd Green Sprint\"},{\"field\":\"description\",\"value\":\"Build a greener future.\",\"evidence\":\"Build a greener future.\"},{\"field\":\"registration_deadline\",\"value\":{\"on\":\"2027-05-10\"},\"evidence\":\"2027-05-10\"},{\"field\":\"official_url\",\"value\":\"https://fynd.example/green-sprint\",\"evidence\":\"https://fynd.example/green-sprint\"}]}",
+      "expected_outcome": {"status": "accepted", "rejection_category": null}
+    },
+    {
+      "fixture_id": "missing_supported_description",
+      "source_text": "Fynd Water Challenge invites teams to solve water access problems. Description: Design practical water solutions.",
+      "expected_fields": {
+        "title": "Fynd Water Challenge",
+        "description": "Design practical water solutions."
+      },
+      "model_output": "{\"fields\":[{\"field\":\"title\",\"value\":\"Fynd Water Challenge\",\"evidence\":\"Fynd Water Challenge\"}]}",
+      "expected_outcome": {"status": "accepted", "rejection_category": null}
+    },
+    {
+      "fixture_id": "incorrect_title_value",
+      "source_text": "Fynd Solar Sprint brings teams together to prototype clean energy ideas.",
+      "expected_fields": {"title": "Fynd Solar Sprint"},
+      "model_output": "{\"fields\":[{\"field\":\"title\",\"value\":\"Fynd Solar Marathon\",\"evidence\":\"Fynd Solar Sprint\"}]}",
+      "expected_outcome": {"status": "accepted", "rejection_category": null}
+    },
+    {
+      "fixture_id": "fabricated_evidence_quote",
+      "source_text": "Fynd Civic Tech Jam builds tools for local communities.",
+      "expected_fields": {"title": "Fynd Civic Tech Jam"},
+      "model_output": "{\"fields\":[{\"field\":\"title\",\"value\":\"Fynd Civic Tech Jam\",\"evidence\":\"Fynd Civic Innovation Jam\"}]}",
+      "expected_outcome": {"status": "rejected", "rejection_category": "ungrounded_evidence"}
+    },
+    {
+      "fixture_id": "malformed_json",
+      "source_text": "Fynd Open Build invites participants to create useful software.",
+      "expected_fields": {"title": "Fynd Open Build"},
+      "model_output": "{fields: [not valid JSON",
+      "expected_outcome": {"status": "rejected", "rejection_category": "malformed_json"}
+    },
+    {
+      "fixture_id": "invalid_registration_date",
+      "source_text": "Fynd Mapathon. Registration deadline: 2027-02-30.",
+      "expected_fields": {"title": "Fynd Mapathon"},
+      "model_output": "{\"fields\":[{\"field\":\"title\",\"value\":\"Fynd Mapathon\",\"evidence\":\"Fynd Mapathon\"},{\"field\":\"registration_deadline\",\"value\":{\"on\":\"2027-02-30\"},\"evidence\":\"2027-02-30\"}]}",
+      "expected_outcome": {"status": "rejected", "rejection_category": "invalid_date"}
+    },
+    {
+      "fixture_id": "invalid_official_url",
+      "source_text": "Fynd Robotics Rally. Official site: javascript:alert(1).",
+      "expected_fields": {"title": "Fynd Robotics Rally"},
+      "model_output": "{\"fields\":[{\"field\":\"title\",\"value\":\"Fynd Robotics Rally\",\"evidence\":\"Fynd Robotics Rally\"},{\"field\":\"official_url\",\"value\":\"javascript:alert(1)\",\"evidence\":\"javascript:alert(1)\"}]}",
+      "expected_outcome": {"status": "rejected", "rejection_category": "invalid_url"}
+    },
+    {
+      "fixture_id": "unsupported_prize_field",
+      "source_text": "Fynd Design Sprint. Prize: a small trophy.",
+      "expected_fields": {"title": "Fynd Design Sprint"},
+      "model_output": "{\"fields\":[{\"field\":\"title\",\"value\":\"Fynd Design Sprint\",\"evidence\":\"Fynd Design Sprint\"},{\"field\":\"prize\",\"value\":\"a small trophy\",\"evidence\":\"a small trophy\"}]}",
+      "expected_outcome": {"status": "rejected", "rejection_category": "unsupported_field"}
+    }
+  ]
+}
