@@ -18,6 +18,8 @@ from app.auth.models import User  # noqa: E402
 from app.database import SessionLocal, engine  # noqa: E402
 from app.discovery import (  # noqa: E402
     DiscoveryCandidate,
+    execution,
+    orchestration,
     persistence,
     run_authorized_extraction_pipeline,
 )
@@ -306,6 +308,137 @@ def test_pipeline_persistence_failure_rolls_back_all_candidate_rows(
                 )
             )
         )
+    ) == 0
+
+
+def test_task6f_selected_source_execution_persists_unpublished_candidate(
+    db_session, monkeypatch
+):
+    publisher_name = f"Task 6F Execution {uuid4().hex}"
+    registry_source_id = f"synthetic-test-source:{publisher_name}"
+    source_url = f"https://events.example.test/2027/{uuid4().hex}"
+    source = SimpleNamespace(
+        id=registry_source_id,
+        homepage_url=source_url,
+        publisher_name=publisher_name,
+        source_kind="aggregator",
+        access={"method": "html", "allowed_hosts": ["example.test"]},
+        limits={
+            "max_response_bytes": 10_000,
+            "max_retries": 1,
+            "min_request_interval_s": 0,
+        },
+    )
+    events = []
+
+    def authorize_for_execution(source_id, _registry_path):
+        events.append("execution_authorization")
+        assert source_id == registry_source_id
+        return source
+
+    def authorize_for_fetch(source_id, _registry_path):
+        events.append("fetch_authorization")
+        assert source_id == registry_source_id
+        return source
+
+    monkeypatch.setattr(execution, "authorize_source_execution", authorize_for_execution)
+    monkeypatch.setattr(
+        orchestration, "authorize_source_execution", authorize_for_fetch
+    )
+
+    def fetch_page(request):
+        events.append("fetch")
+        assert str(request.url) == source_url
+        return httpx.Response(
+            200,
+            content=(
+                b"<html><body><h1>Task 6F PostgreSQL Demo</h1>"
+                b"<p>Open to learners.</p></body></html>"
+            ),
+        )
+
+    extraction_json = (
+        '{"fields":[{"field":"title","value":"Task 6F PostgreSQL Demo",'
+        '"evidence":"Task 6F PostgreSQL Demo"},{"field":"description",'
+        '"value":"Open to learners.","evidence":"Open to learners."}]}'
+    )
+
+    def model_response(request):
+        events.append("model")
+        return httpx.Response(200, json={"response": extraction_json})
+
+    savepoint = db_session.begin_nested()
+    try:
+        with OllamaExtractionClient(
+            model="fixture-model",
+            transport=httpx.MockTransport(model_response),
+        ) as client:
+            result = execution.execute_selected_sources(
+                db_session,
+                [registry_source_id],
+                ollama_client=client,
+                fetch_transport=httpx.MockTransport(fetch_page),
+            )
+
+        assert events == [
+            "execution_authorization",
+            "fetch_authorization",
+            "fetch",
+            "model",
+        ]
+        assert len(result.outcomes) == 1
+        outcome = result.outcomes[0]
+        assert outcome.source_id == registry_source_id
+        assert outcome.status == "succeeded"
+        assert outcome.source_url == source_url
+        assert outcome.reason is None
+        assert outcome.persistence is not None
+        assert outcome.persistence.discovered == 1
+        assert outcome.persistence.failed == 0
+
+        persisted_source = db_session.scalar(
+            select(CompetitionSource).where(
+                CompetitionSource.normalized_url == source_url
+            )
+        )
+        assert persisted_source is not None
+        persisted_source_id = persisted_source.id
+        competition_id = persisted_source.competition_id
+        assert persisted_source.registry_source_id == registry_source_id
+        competition = db_session.get(Competition, competition_id)
+        assert competition is not None
+        assert competition.is_published is False
+        assert competition.title is None
+        evidence = db_session.scalars(
+            select(FieldEvidence)
+            .where(FieldEvidence.source_id == persisted_source_id)
+            .order_by(FieldEvidence.field_name)
+        ).all()
+        assert [(item.field_name, item.review_state) for item in evidence] == [
+            ("description", "candidate"),
+            ("title", "candidate"),
+        ]
+        assert {item.field_name: item.evidence_excerpt for item in evidence} == {
+            "description": "Open to learners.",
+            "title": "Task 6F PostgreSQL Demo",
+        }
+    finally:
+        savepoint.rollback()
+
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(CompetitionSource)
+        .where(CompetitionSource.normalized_url == source_url)
+    ) == 0
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(Competition)
+        .where(Competition.id == competition_id)
+    ) == 0
+    assert db_session.scalar(
+        select(func.count())
+        .select_from(FieldEvidence)
+        .where(FieldEvidence.source_id == persisted_source_id)
     ) == 0
 
 
